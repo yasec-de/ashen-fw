@@ -427,44 +427,7 @@ fn verify_remote_static<K: KeyStore>(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A minimal xorshift64* PRNG.
-    ///
-    /// **Not cryptographically secure.** This exists purely as a
-    /// deterministic, fast [`Random`] source for unit tests, so that test
-    /// runs are fully reproducible. Production code must use a true
-    /// hardware entropy source (see [`crate::hw_rng`]).
-    #[derive(Clone)]
-    struct XorShiftRng(u64);
-
-    impl XorShiftRng {
-        fn new(seed: u64) -> Self {
-            Self(if seed == 0 {
-                0x9E37_79B9_7F4A_7C15
-            } else {
-                seed
-            })
-        }
-
-        fn next_u64(&mut self) -> u64 {
-            let mut x = self.0;
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            self.0 = x;
-            x
-        }
-    }
-
-    impl Random for XorShiftRng {
-        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), snow::Error> {
-            for chunk in dest.chunks_mut(8) {
-                let bytes = self.next_u64().to_le_bytes();
-                chunk.copy_from_slice(&bytes[..chunk.len()]);
-            }
-            Ok(())
-        }
-    }
+    use crate::test_util::XorShiftRng;
 
     /// Fixed seed used by all unit tests, so that test runs are
     /// deterministic and reproducible.

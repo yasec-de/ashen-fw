@@ -51,6 +51,13 @@ default = []
 # and `cargo test` run host-side without extra flags.
 embedded = []
 debug-mode = []
+# Exposes `ashen_fw::test_util` outside of this crate's own test builds, for
+# use by the host-side integration tests under `tests/`. Enabled for those
+# via the `[dev-dependencies]` entry below.
+test-util = []
+
+[dev-dependencies]
+ashen-fw = { path = ".", features = ["test-util"] }
 
 [profile.dev]
 opt-level = "s"     # Optimize for size in dev builds too

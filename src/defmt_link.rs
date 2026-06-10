@@ -43,6 +43,9 @@ struct RttChannel {
     flags: AtomicU32,
 }
 
+// SAFETY: all mutable state (`write`, `read`, `flags`) is accessed through
+// atomics with appropriate ordering; `name` and `buffer` are read-only raw
+// pointers to other `'static` data, set up once at construction.
 unsafe impl Sync for RttChannel {}
 
 impl RttChannel {
@@ -132,10 +135,17 @@ struct RttHeader {
     up_channel: RttChannel,
 }
 
+// SAFETY: all fields besides `up_channel` are immutable after
+// construction; `up_channel`'s `Sync` impl covers its own interior
+// mutability.
 unsafe impl Sync for RttHeader {}
 
 struct RttBuffer(UnsafeCell<[u8; RTT_BUF_SIZE]>);
 
+// SAFETY: the buffer is only ever accessed through `RttChannel::write_impl`,
+// whose `cursor`/`available` bounds are derived from `RttChannel`'s atomic
+// `read`/`write` cursors, which serialize access to each region of the
+// buffer.
 unsafe impl Sync for RttBuffer {}
 
 impl RttBuffer {
@@ -201,6 +211,9 @@ struct LogQueueInner {
 
 struct LogQueue(UnsafeCell<LogQueueInner>);
 
+// SAFETY: all accesses to the inner `UnsafeCell` go through `push`/`pop`,
+// both of which wrap their access in `critical_section::with`, so concurrent
+// (including interrupt-context) accesses are mutually exclusive.
 unsafe impl Sync for LogQueue {}
 
 impl LogQueue {
@@ -288,6 +301,10 @@ struct EncoderState {
     overflow: UnsafeCell<bool>,
 }
 
+// SAFETY: all fields are only accessed between matching `acquire`/`release`
+// calls, which bracket access with a `critical_section` (see `acquire` and
+// `release` below), so concurrent (including interrupt-context) accesses are
+// mutually exclusive.
 unsafe impl Sync for EncoderState {}
 
 impl EncoderState {
@@ -368,6 +385,10 @@ static ENCODER_STATE: EncoderState = EncoderState::new();
 #[defmt::global_logger]
 struct Logger;
 
+// SAFETY: `acquire`/`release` are correctly paired via `ENCODER_STATE`'s
+// critical-section guard (see `EncoderState::acquire`/`release`), and
+// `write`/`flush` are only called between matching `acquire`/`release`
+// calls per `defmt::Logger`'s contract.
 unsafe impl defmt::Logger for Logger {
     fn acquire() {
         ENCODER_STATE.acquire();

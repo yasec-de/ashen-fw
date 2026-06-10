@@ -7,7 +7,7 @@
 
 use std::thread;
 
-use ashen_fw::noise_link::{KeyStore, MemoryKeyStore, SecureLink, generate_keypair};
+use ashen_fw::noise_link::{Error, KeyStore, MemoryKeyStore, SecureLink, generate_keypair};
 use ashen_fw::protocol::{EchoRequest, Envelope, Msg, SessionEnd};
 
 mod common;
@@ -80,6 +80,97 @@ fn handshake_and_echo_round_trips() {
     });
 
     server_thread.join().expect("server thread panicked");
+}
+
+/// After a client has trusted a server's static key via TOFU on first
+/// connection, a later handshake against a *different* server (presenting a
+/// different static key) must be rejected with [`Error::UntrustedPeer`],
+/// rather than silently re-trusting the new key.
+#[test]
+fn handshake_rejects_mismatched_remote_static_key() {
+    let server_a_keys = generate_keypair(rng(0x1234_5678)).unwrap();
+    let server_b_keys = generate_keypair(rng(0x5555_5555_5555)).unwrap();
+    let client_keys = generate_keypair(rng(0x9876_5432_1234)).unwrap();
+
+    let mut client_keystore = MemoryKeyStore::default();
+
+    // First connection: client trusts server A's static key via TOFU.
+    {
+        let (client_io, server_io) = duplex_pair();
+        let server_a_static = server_a_keys.private.clone();
+        let server_thread = thread::spawn(move || {
+            embassy_futures::block_on(async move {
+                let mut keystore = MemoryKeyStore::default();
+                let _link = SecureLink::responder_handshake(
+                    server_io,
+                    &server_a_static,
+                    rng(0x00C0_FFEE),
+                    &mut keystore,
+                )
+                .await
+                .expect("server A handshake failed");
+            });
+        });
+
+        embassy_futures::block_on(async {
+            let _client = SecureLink::initiator_handshake(
+                client_io,
+                &client_keys.private,
+                rng(0xDEAD_BEEF),
+                &mut client_keystore,
+            )
+            .await
+            .expect("client handshake with server A failed");
+        });
+
+        server_thread.join().expect("server A thread panicked");
+    }
+
+    let server_a_public: [u8; 32] = server_a_keys.public.clone().try_into().unwrap();
+    assert_eq!(client_keystore.trusted_key(), Some(server_a_public));
+
+    // Second connection: a different peer (server B) presents a different
+    // static key. The client must reject it rather than re-trusting it.
+    {
+        let (client_io, server_io) = duplex_pair();
+        let server_b_static = server_b_keys.private.clone();
+        let server_thread = thread::spawn(move || {
+            embassy_futures::block_on(async move {
+                let mut keystore = MemoryKeyStore::default();
+                // The responder side completes its own handshake fine; only
+                // the initiator (client) has a pre-existing trust record to
+                // violate.
+                let _ = SecureLink::responder_handshake(
+                    server_io,
+                    &server_b_static,
+                    rng(0x1357_9BDF),
+                    &mut keystore,
+                )
+                .await;
+            });
+        });
+
+        embassy_futures::block_on(async {
+            let result = SecureLink::initiator_handshake(
+                client_io,
+                &client_keys.private,
+                rng(0x2468_ACE0),
+                &mut client_keystore,
+            )
+            .await;
+
+            match result {
+                Err(Error::UntrustedPeer) => {}
+                Err(other) => panic!("expected Err(UntrustedPeer), got Err({other:?})"),
+                Ok(_) => panic!("expected Err(UntrustedPeer), got Ok(_)"),
+            }
+        });
+
+        server_thread.join().expect("server B thread panicked");
+    }
+
+    // The original trusted key must be unchanged.
+    assert_eq!(client_keystore.trusted_key(), Some(server_a_public));
 }
 
 #[test]
