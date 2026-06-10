@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [main]
   pull_request:
-    branches: [master]
+    branches: [main]
 
 jobs:
   build-and-test:
@@ -30,7 +30,7 @@ jobs:
         run: nix develop --command cargo fmt --check
 
       - name: Run clippy
-        run: nix develop --command cargo clippy --target thumbv6m-none-eabi -- -D warnings
+        run: nix develop --command cargo clippy --target thumbv7em-none-eabihf -- -D warnings
 
       - name: Build documentation
-        run: nix develop --command cargo doc --no-deps --target thumbv6m-none-eabi
+        run: nix develop --command cargo doc --no-deps --target thumbv7em-none-eabihf

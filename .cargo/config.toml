@@ -1,8 +1,8 @@
 [target.'cfg(all(target_arch = "arm", target_os = "none"))']
-runner = "probe-rs run --chip STM32L031G6 --connect-under-reset --protocol swd --speed 1000"
+runner = "probe-rs run --chip STM32G474RB --connect-under-reset --protocol swd --speed 1000"
 
 [build]
-target = "thumbv6m-none-eabi"
+target = "thumbv7em-none-eabihf"
 
 [env]
 DEFMT_LOG = "trace"

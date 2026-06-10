@@ -13,7 +13,7 @@ let
     ;
 
   topLevelOverlay = topFinal: topPrev: {
-    christmas = topPrev.callPackage ./packages/christmas.nix { };
+    ashen-fw = topPrev.callPackage ./packages/ashen-fw.nix { };
   };
 
   rustOverlay = rust-overlay.overlays.default;

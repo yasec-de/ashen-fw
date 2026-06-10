@@ -11,10 +11,10 @@ flakeInputs.nixpkgs-lib.lib.genAttrs
     in
     {
       default = pkgs.mkShell {
-        name = "christmas-rs-dev";
+        name = "ashen-fw-dev";
 
-        # Inherit all build inputs from the christmas package
-        inputsFrom = [ pkgs.christmas ];
+        # Inherit all build inputs from the ashen-fw package
+        inputsFrom = [ pkgs.ashen-fw ];
 
         # Add additional development-only tools
         nativeBuildInputs = with pkgs; [

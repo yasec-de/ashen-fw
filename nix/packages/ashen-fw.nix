@@ -35,14 +35,14 @@ rustPlatform.buildRustPackage {
 
   buildPhase = ''
     runHook preBuild
-    cargo build --release --target thumbv6m-none-eabi
+    cargo build --release --target thumbv7em-none-eabihf
     runHook postBuild
   '';
 
   installPhase = ''
     runHook preInstall
     mkdir -p $out/bin
-    cp target/thumbv6m-none-eabi/release/${cargoToml.package.name} $out/bin/
+    cp target/thumbv7em-none-eabihf/release/${cargoToml.package.name} $out/bin/
     runHook postInstall
   '';
 
@@ -52,7 +52,7 @@ rustPlatform.buildRustPackage {
   RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
 
   meta = with lib; {
-    description = "Christmas ornament embedded system.";
+    description = "Ashen firmware.";
     license = licenses.mit;
     platforms = platforms.all;
   };

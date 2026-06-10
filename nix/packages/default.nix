@@ -8,11 +8,11 @@ flakeInputs.nixpkgs-lib.lib.genAttrs
     system:
     let
       inherit (flakeInputs.self.legacyPackages.${system})
-        christmas
+        ashen-fw
         ;
     in
     {
-      inherit christmas;
-      default = christmas;
+      inherit ashen-fw;
+      default = ashen-fw;
     }
   )
