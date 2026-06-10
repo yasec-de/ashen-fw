@@ -4,6 +4,7 @@
   rust-bin,
   rust-analyzer,
   probe-rs-tools,
+  protobuf,
 }:
 let
   cargoToml = builtins.fromTOML (builtins.readFile ../../Cargo.toml);
@@ -28,6 +29,7 @@ rustPlatform.buildRustPackage {
   nativeBuildInputs = [
     rust-analyzer
     probe-rs-tools
+    protobuf
   ];
 
   # Disable auditable for embedded targets (doesn't work with rust-lld)
@@ -35,7 +37,7 @@ rustPlatform.buildRustPackage {
 
   buildPhase = ''
     runHook preBuild
-    cargo build --release --target thumbv7em-none-eabihf
+    cargo build --release --features embedded --target thumbv7em-none-eabihf
     runHook postBuild
   '';
 
@@ -46,7 +48,13 @@ rustPlatform.buildRustPackage {
     runHook postInstall
   '';
 
-  doCheck = false;
+  checkPhase = ''
+    runHook preCheck
+    cargo test --release
+    runHook postCheck
+  '';
+
+  doCheck = true;
 
   # Set RUST_SRC_PATH for rust-analyzer
   RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";

@@ -1,0 +1,162 @@
+//! Host-side tests for the protobuf protocol in [`ashen_fw::protocol`].
+
+use std::thread;
+
+use ashen_fw::noise_link::{MemoryKeyStore, SecureLink, generate_keypair};
+use ashen_fw::protocol::{EchoRequest, Envelope, Msg, SessionEnd};
+
+mod common;
+use common::{duplex_pair, rng};
+
+#[test]
+fn echo_request_replies_with_value_plus_one() {
+    let server_keys = generate_keypair(rng(0x1234_5678)).unwrap();
+    let client_keys = generate_keypair(rng(0x9876_5432_1234)).unwrap();
+
+    let (client_io, server_io) = duplex_pair();
+
+    let server_static = server_keys.private.clone();
+    let server_thread = thread::spawn(move || {
+        embassy_futures::block_on(async move {
+            let mut keystore = MemoryKeyStore::default();
+            let mut link =
+                SecureLink::responder_handshake(server_io, &server_static, rng(0x00C0_FFEE), &mut keystore)
+                    .await
+                    .expect("server handshake failed");
+
+            match link.run_session().await {
+                SessionEnd::Disconnected => {}
+                SessionEnd::Error(e) => panic!("unexpected session error: {e:?}"),
+            }
+        });
+    });
+
+    embassy_futures::block_on(async move {
+        let mut client_keystore = MemoryKeyStore::default();
+        let mut client = SecureLink::initiator_handshake(
+            client_io,
+            &client_keys.private,
+            rng(0xDEAD_BEEF),
+            &mut client_keystore,
+        )
+        .await
+        .expect("client handshake failed");
+
+        client
+            .send_envelope(&Envelope {
+                r#msg: Some(Msg::EchoRequest(EchoRequest { r#value: 41 })),
+            })
+            .await
+            .expect("send echo request failed");
+
+        let response = client.receive_envelope().await.expect("receive echo response");
+        match response {
+            Envelope {
+                r#msg: Some(Msg::EchoResponse(echo)),
+            } => assert_eq!(echo.r#value, 42),
+            other => panic!("expected echo response, got {other:?}"),
+        }
+
+        client.send_disconnect().await.expect("send disconnect failed");
+    });
+
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
+fn send_log_message_round_trips() {
+    let server_keys = generate_keypair(rng(0x3333_3333)).unwrap();
+    let client_keys = generate_keypair(rng(0x4444_4444_4444)).unwrap();
+
+    let (client_io, server_io) = duplex_pair();
+
+    let server_static = server_keys.private.clone();
+    let server_thread = thread::spawn(move || {
+        embassy_futures::block_on(async move {
+            let mut keystore = MemoryKeyStore::default();
+            let mut link =
+                SecureLink::responder_handshake(server_io, &server_static, rng(0xC0DE_C0DE), &mut keystore)
+                    .await
+                    .expect("server handshake failed");
+
+            link.send_log_message(b"defmt frame bytes")
+                .await
+                .expect("send log message failed");
+
+            match link.run_session().await {
+                SessionEnd::Disconnected => {}
+                SessionEnd::Error(e) => panic!("unexpected session error: {e:?}"),
+            }
+        });
+    });
+
+    embassy_futures::block_on(async move {
+        let mut client_keystore = MemoryKeyStore::default();
+        let mut client = SecureLink::initiator_handshake(
+            client_io,
+            &client_keys.private,
+            rng(0xFEED_FACE),
+            &mut client_keystore,
+        )
+        .await
+        .expect("client handshake failed");
+
+        let response = client.receive_envelope().await.expect("receive log message");
+        match response {
+            Envelope {
+                r#msg: Some(Msg::Log(log)),
+            } => {
+                assert_eq!(log.r#data, b"defmt frame bytes");
+            }
+            other => panic!("expected log message, got {other:?}"),
+        }
+
+        client.send_disconnect().await.expect("send disconnect failed");
+    });
+
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
+fn echo_request_overflow_panics() {
+    let server_keys = generate_keypair(rng(0x1111_1111)).unwrap();
+    let client_keys = generate_keypair(rng(0x2222_2222_2222)).unwrap();
+
+    let (client_io, server_io) = duplex_pair();
+
+    let server_static = server_keys.private.clone();
+    let server_thread = thread::spawn(move || {
+        embassy_futures::block_on(async move {
+            let mut keystore = MemoryKeyStore::default();
+            let mut link =
+                SecureLink::responder_handshake(server_io, &server_static, rng(0xAAAA_AAAA), &mut keystore)
+                    .await
+                    .expect("server handshake failed");
+
+            // Should panic on overflow rather than wrap or return an error.
+            link.run_session().await;
+        });
+    });
+
+    embassy_futures::block_on(async move {
+        let mut client_keystore = MemoryKeyStore::default();
+        let mut client = SecureLink::initiator_handshake(
+            client_io,
+            &client_keys.private,
+            rng(0xBBBB_BBBB),
+            &mut client_keystore,
+        )
+        .await
+        .expect("client handshake failed");
+
+        client
+            .send_envelope(&Envelope {
+                r#msg: Some(Msg::EchoRequest(EchoRequest { r#value: u64::MAX })),
+            })
+            .await
+            .expect("send echo request failed");
+    });
+
+    let result = server_thread.join();
+    assert!(result.is_err(), "server thread should have panicked");
+}

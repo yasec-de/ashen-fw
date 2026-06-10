@@ -23,7 +23,7 @@ nix build
 # Binary at: result/bin/ashen-fw
 
 # Or with cargo:
-cargo build --release --target thumbv7em-none-eabihf
+cargo build --release --features embedded --target thumbv7em-none-eabihf
 ```
 
 ### Flash
@@ -31,7 +31,7 @@ cargo build --release --target thumbv7em-none-eabihf
 The project uses cargo's runner configuration for flashing:
 
 ```bash
-cargo run --release
+cargo run --release --features embedded --target thumbv7em-none-eabihf
 ```
 
 This automatically invokes `probe-rs run --chip STM32G474RB` after building (configured in `.cargo/config.toml`).
@@ -42,8 +42,8 @@ This automatically invokes `probe-rs run --chip STM32G474RB` after building (con
 nix develop  # Enter development shell with all tools
 
 # Available:
-cargo build --release
-cargo run --release
+cargo build --release --features embedded --target thumbv7em-none-eabihf
+cargo run --release --features embedded --target thumbv7em-none-eabihf
 cargo doc --open --no-deps
 nix fmt  # Format all code (Rust, Nix, etc.)
 ```
@@ -53,6 +53,34 @@ For automatic environment activation, use direnv:
 echo "use flake" > .envrc
 direnv allow
 ```
+
+## Secure Link
+
+[`src/noise_link.rs`](src/noise_link.rs) implements a Noise_XX handshake
+(trust-on-first-use of the remote static key) framed with a vendored,
+variable-length COBS implementation ([`src/cobs.rs`](src/cobs.rs)) over a
+byte transport, with an authenticated echo loop once the handshake
+completes. Frames are delimited by `0x00`; if a frame is malformed, the
+implementation resynchronizes by discarding bytes up to the next
+delimiter and continuing with the next frame. Errors encountered while
+running the echo loop are recorded in a fixed-size ring buffer
+([`src/error_log.rs`](src/error_log.rs), capacity 50) with their source,
+a source-specific code, and the uptime (in seconds) at which they
+occurred.
+
+The link is built as part of the `ashen_fw` library so it can be
+exercised on the host:
+
+```bash
+cargo test
+```
+
+This builds the link implementation for the host, sets up an in-memory
+duplex transport, runs the handshake, performs echo round trips
+(including a multi-frame ~513-byte payload), and exercises frame
+resynchronization and error logging. The `embedded` feature (off by
+default) gates the firmware binary and its embedded-only dependencies,
+which require the `thumbv7em-none-eabihf` target.
 
 ## Debug Mode
 
