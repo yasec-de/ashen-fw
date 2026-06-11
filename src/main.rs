@@ -5,7 +5,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 
-use ashen_fw::flash_keystore::{FlashKeyStore, keystore_offset};
+use ashen_fw::flash_keystore::FlashKeyStore;
 use ashen_fw::hw_rng::HwRng;
 use ashen_fw::noise_link::{Random, SecureLink, generate_keypair};
 use ashen_fw::protocol::SessionEnd;
@@ -74,7 +74,7 @@ async fn main(spawner: Spawner) {
         .expect("failed to spawn blink task");
 
     let flash = Flash::new_blocking(p.FLASH);
-    let mut keystore = FlashKeyStore::new(flash, keystore_offset());
+    let mut keystore = FlashKeyStore::new(flash);
 
     // This boot's ephemeral local keypair.
     // SAFETY: this `HwRng` is fully consumed by `generate_keypair` before

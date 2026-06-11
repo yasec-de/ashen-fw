@@ -10,6 +10,11 @@
  * `_keystore_start` is exported for use from Rust (see
  * src/flash_keystore.rs) to compute the flash offset passed to
  * `FlashKeyStore::new`.
+ *
+ * This section is inserted after `.uninit` (a RAM section near the end of
+ * the linker script), rather than after `.gnu.sgstubs` (in FLASH), so that
+ * its location-counter advancement doesn't push `__veneer_limit` past
+ * `_keystore_start` once the section has actual content.
  */
 SECTIONS
 {
@@ -18,7 +23,7 @@ SECTIONS
     _keystore_start = .;
     KEEP(*(.keystore));
   } > FLASH
-} INSERT AFTER .gnu.sgstubs
+} INSERT AFTER .uninit
 
 ASSERT(__veneer_limit <= _keystore_start, "
 ERROR: the firmware image (.text/.rodata/.data) has grown into the reserved

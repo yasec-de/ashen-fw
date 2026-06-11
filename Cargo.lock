@@ -49,6 +49,7 @@ dependencies = [
 name = "ashen-fw"
 version = "0.1.0"
 dependencies = [
+ "ashen-fw",
  "cortex-m",
  "cortex-m-rt",
  "critical-section",
@@ -62,7 +63,6 @@ dependencies = [
  "embedded-hal 0.2.7",
  "embedded-io 0.6.1",
  "embedded-io-async 0.6.1",
- "embedded-storage",
  "heapless 0.8.0",
  "micropb",
  "micropb-gen",

@@ -1,1 +1,1 @@
-DO NOT RUN cargo DIRECTLY - USE IT VIA nix
+DO NOT RUN cargo DIRECTLY - USE IT VIA nix (build/develop)
