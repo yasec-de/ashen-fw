@@ -4,8 +4,7 @@
 //! This module provides [`HwRng`], an implementation of
 //! [`crate::noise_link::Random`] (snow's RNG trait) suitable for use with
 //! [`crate::noise_link::generate_keypair`] and
-//! [`crate::noise_link::SecureLink::responder_handshake`]/
-//! [`crate::noise_link::SecureLink::initiator_handshake`].
+//! [`crate::noise_link::SecureLink::responder_handshake`].
 
 use embassy_stm32::rng::{Instance, Rng};
 

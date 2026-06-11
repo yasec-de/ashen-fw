@@ -148,7 +148,7 @@ fn builder(rng: Box<dyn Random>) -> Result<Builder<'static>, Error> {
 }
 
 /// Generates a new static Curve25519 keypair for use with
-/// [`SecureLink::responder_handshake`] or [`SecureLink::initiator_handshake`].
+/// [`SecureLink::responder_handshake`].
 pub fn generate_keypair(rng: Box<dyn Random>) -> Result<snow::Keypair, Error> {
     Ok(builder(rng)?.generate_keypair()?)
 }
@@ -228,6 +228,10 @@ async fn do_responder_handshake<T: Read + Write, K: KeyStore>(
 ///
 /// Returns the resulting [`TransportState`], the verified remote static key,
 /// and whether it was newly trusted (see [`verify_remote_static`]).
+///
+/// The firmware only ever acts as the responder; this side is only used by
+/// the host-side test harness to simulate the firmware's peer.
+#[cfg(feature = "test-util")]
 async fn do_initiator_handshake<T: Read + Write, K: KeyStore>(
     io: &mut T,
     local_static_key: &[u8],
@@ -283,7 +287,7 @@ fn log_tofu_status(_newly_trusted: bool) {}
 /// If [`SecureLink::run_session`] ends (the peer disconnected, or an error
 /// occurred), the link can be put back into a working state without
 /// reallocating the underlying transport by calling
-/// [`SecureLink::restart_responder`] or [`SecureLink::restart_initiator`].
+/// [`SecureLink::restart_responder`].
 pub struct SecureLink<T> {
     io: T,
     transport: TransportState,
@@ -316,6 +320,10 @@ impl<T: Read + Write> SecureLink<T> {
     /// Performs the initiator side of a Noise_XX handshake (`-> e` then `<-
     /// e, ee, s, es` then `-> s, se`), verifying the responder's static key
     /// against `keystore` via TOFU.
+    ///
+    /// The firmware only ever acts as the responder; this side is only used
+    /// by the host-side test harness to simulate the firmware's peer.
+    #[cfg(feature = "test-util")]
     pub async fn initiator_handshake<K: KeyStore>(
         mut io: T,
         local_static_key: &[u8],
@@ -359,6 +367,10 @@ impl<T: Read + Write> SecureLink<T> {
     /// Re-runs the initiator handshake on this link's existing transport,
     /// replacing its transport state and [`SecureLink::remote_static`] in
     /// place. See [`SecureLink::restart_responder`].
+    ///
+    /// The firmware only ever acts as the responder; this side is only used
+    /// by the host-side test harness to simulate the firmware's peer.
+    #[cfg(feature = "test-util")]
     pub async fn restart_initiator<K: KeyStore>(
         &mut self,
         local_static_key: &[u8],

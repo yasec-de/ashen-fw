@@ -60,8 +60,7 @@ pub enum SessionEnd {
     Disconnected,
     /// A transport or protocol error occurred. The link should be
     /// restarted (see
-    /// [`SecureLink::restart_responder`](crate::noise_link::SecureLink::restart_responder)/
-    /// [`SecureLink::restart_initiator`](crate::noise_link::SecureLink::restart_initiator))
+    /// [`SecureLink::restart_responder`](crate::noise_link::SecureLink::restart_responder))
     /// with a fresh handshake.
     Error(Error),
 }
