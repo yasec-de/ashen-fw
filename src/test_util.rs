@@ -76,7 +76,6 @@ impl<T: Read + Write> NoiseLink<T> {
         mut io: T,
         local_static_key: &[u8],
         rng: Box<dyn Random>,
-        keystore: &mut K,
     ) -> Result<Self, Error> {
         let mut hs = builder(rng)?
             .local_private_key(local_static_key)?
@@ -86,18 +85,18 @@ impl<T: Read + Write> NoiseLink<T> {
 
         // -> e
         let len = hs.write_message(&[], &mut buf)?;
-        cobs::write_frame(io, &buf[..len]).await?;
+        cobs::write_frame(&mut io, &buf[..len]).await?;
 
         // <- e, ee, s, es
-        let msg = cobs::read_frame(io).await?;
+        let msg = cobs::read_frame(&mut io).await?;
         hs.read_message(&msg, &mut buf)?;
 
         // -> s, se
         let len = hs.write_message(&[], &mut buf)?;
-        cobs::write_frame(io, &buf[..len]).await?;
+        cobs::write_frame(&mut io, &buf[..len]).await?;
 
         let transport = hs.into_transport_mode()?;
-        let mut link = Self {
+        let link = Self {
             io,
             transport,
             peer_trusted: true,

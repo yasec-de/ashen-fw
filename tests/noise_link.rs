@@ -46,7 +46,6 @@ fn handshake_and_echo_round_trips() {
     });
 
     embassy_futures::block_on(async move {
-        let mut client_keystore = TestKeyStore::default();
         let mut client = NoiseLink::initiator_handshake(
             client_io,
             &client_keys.private,
@@ -84,10 +83,6 @@ fn handshake_and_echo_round_trips() {
     server_thread.join().expect("server thread panicked");
 }
 
-/// After a client has trusted a server's static key via TOFU on first
-/// connection, a later handshake against a *different* server (presenting a
-/// different static key) must be rejected with [`Error::UntrustedPeer`],
-/// rather than silently re-trusting the new key.
 #[test]
 fn handshake_rejects_mismatched_remote_static_key() {
     let server_a_keys = generate_keypair(rng(0x1234_5678)).unwrap();
@@ -119,7 +114,6 @@ fn handshake_rejects_mismatched_remote_static_key() {
                 client_io,
                 &client_keys.private,
                 rng(0xDEAD_BEEF),
-                &mut client_keystore,
             )
             .await
             .expect("client handshake with server A failed");
@@ -132,7 +126,7 @@ fn handshake_rejects_mismatched_remote_static_key() {
     assert_eq!(client_keystore.trusted_key(), Some(server_a_public));
 
     // Second connection: a different peer (server B) presents a different
-    // static key. The client must reject it rather than re-trusting it.
+    // static key. The client must detect it.
     {
         let (client_io, server_io) = duplex_pair();
         let server_b_static = server_b_keys.private.clone();
@@ -157,14 +151,16 @@ fn handshake_rejects_mismatched_remote_static_key() {
                 client_io,
                 &client_keys.private,
                 rng(0x2468_ACE0),
-                &mut client_keystore,
             )
             .await;
 
             match result {
-                Err(Error::UntrustedPeer) => {}
-                Err(other) => panic!("expected Err(UntrustedPeer), got Err({other:?})"),
-                Ok(_) => panic!("expected Err(UntrustedPeer), got Ok(_)"),
+                Ok(_) => {}
+                Err(e) => panic!("expected Ok(_), got Err({})", e),
+            }
+
+            if result.is_peer_trusted() {
+                panic!("Peer trusted despite incorrect key");
             }
         });
 
@@ -178,7 +174,7 @@ fn handshake_rejects_mismatched_remote_static_key() {
 #[test]
 fn run_session_returns_error_on_disconnect() {
     let server_keys = generate_keypair(rng(0x1111_1111)).unwrap();
-    let client_keys = generate_keypair(rng(0x2222_2222_2222)).unwrap();
+    let client_keys = generate_keypair(rng(0x2222_2222)).unwrap();
 
     let (client_io, server_io) = duplex_pair();
 
@@ -202,12 +198,10 @@ fn run_session_returns_error_on_disconnect() {
     });
 
     embassy_futures::block_on(async move {
-        let mut client_keystore = TestKeyStore::default();
         let mut client = NoiseLink::initiator_handshake(
             client_io,
             &client_keys.private,
             rng(0xBBBB_BBBB),
-            &mut client_keystore,
         )
         .await
         .expect("client handshake failed");

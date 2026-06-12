@@ -141,39 +141,46 @@ impl<T: Read + Write> NoiseLink<T> {
         let mut buf = vec![0u8; cobs::MAX_PAYLOAD_LEN];
 
         // -> e
-        let msg = cobs::read_frame(io).await?;
+        let msg = cobs::read_frame(&mut io).await?;
         hs.read_message(&msg, &mut buf)?;
 
         // <- e, ee, s, es
         let len = hs.write_message(&[], &mut buf)?;
-        cobs::write_frame(io, &buf[..len]).await?;
+        cobs::write_frame(&mut io, &buf[..len]).await?;
 
         // -> s, se
-        let msg = cobs::read_frame(io).await?;
+        let msg = cobs::read_frame(&mut io).await?;
         hs.read_message(&msg, &mut buf)?;
+        let transport = hs.into_transport_mode()?;
 
-        let remote_static = hs
+        let remote_static = transport
             .get_remote_static()
             .expect("XX responder always learns remote static");
-        let mut key = [0u8; 32];
-        key.copy_from_slice(remote_static);
 
         let peer_trusted = match keystore.trusted_key() {
             Some(trusted) => bool::from(trusted.ct_eq(&remote_static)),
             None => false,
         };
 
-        let transport = hs.into_transport_mode()?;
         let mut link = Self {
             io,
             transport,
             peer_trusted,
         };
-        if !peer_trusted {
-            // First connection: trust-on-first-use.
-            link.trust(keystore);
-        }
         Ok(link)
+    }
+
+    pub fn peer_key(&mut self) -> &[u8; 32] {
+        let remote_static = self.transport
+            .get_remote_static()
+            .expect("XX responder always learns remote static");
+        let mut key = [0u8; 32];
+        key.copy_from_slice(remote_static);
+        &key
+    }
+
+    pub fn is_peer_trusted(&self) -> bool {
+        self.peer_trusted
     }
 
     /// Records this link's [`NoiseLink::remote_static`] as the trusted peer
@@ -189,7 +196,7 @@ impl<T: Read + Write> NoiseLink<T> {
         let mut key = [0u8; 32];
         key.copy_from_slice(remote_static);
         
-        keystore.trust(remote_static);
+        keystore.trust(key);
         self.peer_trusted = true;
         Ok(())
     }

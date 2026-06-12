@@ -34,12 +34,10 @@ fn echo_request_replies_with_value_plus_one() {
     });
 
     embassy_futures::block_on(async move {
-        let mut client_keystore = TestKeyStore::default();
         let mut client = NoiseLink::initiator_handshake(
             client_io,
             &client_keys.private,
             rng(0xDEAD_BEEF),
-            &mut client_keystore,
         )
         .await
         .expect("client handshake failed");
@@ -94,12 +92,10 @@ fn send_log_message_round_trips() {
     });
 
     embassy_futures::block_on(async move {
-        let mut client_keystore = TestKeyStore::default();
         let mut client = NoiseLink::initiator_handshake(
             client_io,
             &client_keys.private,
             rng(0xFEED_FACE),
-            &mut client_keystore,
         )
         .await
         .expect("client handshake failed");
@@ -158,12 +154,10 @@ fn erase_request_ends_session_and_clears_keystore() {
     });
 
     embassy_futures::block_on(async move {
-        let mut client_keystore = TestKeyStore::default();
         let mut client = NoiseLink::initiator_handshake(
             client_io,
             &client_keys.private,
             rng(0xDEAD_BEEF),
-            &mut client_keystore,
         )
         .await
         .expect("client handshake failed");
@@ -196,12 +190,10 @@ fn echo_request_overflow_panics() {
     });
 
     embassy_futures::block_on(async move {
-        let mut client_keystore = TestKeyStore::default();
         let mut client = NoiseLink::initiator_handshake(
             client_io,
             &client_keys.private,
             rng(0xBBBB_BBBB),
-            &mut client_keystore,
         )
         .await
         .expect("client handshake failed");

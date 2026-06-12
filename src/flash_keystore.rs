@@ -83,7 +83,7 @@ impl KeyStore for FlashKeyStore<'_> {
         let page_start = ptr as u32 - FLASH_BASE as u32;
 
         self.flash
-            .blocking_erase( , page_start + MAX_ERASE_SIZE as u32)
+            .blocking_erase(page_start, page_start + MAX_ERASE_SIZE as u32)
             .expect("Peer key store flash erase failed");
 
         self.cached = None;
