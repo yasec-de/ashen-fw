@@ -21,7 +21,7 @@ mod device_pb {
     include!(concat!(env!("OUT_DIR"), "/device.rs"));
 }
 
-pub use device_pb::ashen_::{Disconnect, EchoRequest, EchoResponse, Envelope, Envelope_::Msg, LogMessage};
+pub use device_pb::ashen_::{Disconnect, EchoRequest, EchoResponse, Envelope, Envelope_::Msg, Erase, LogMessage};
 
 /// Maximum size, in bytes, of a single encoded `defmt` log frame forwarded
 /// to the host as a [`LogMessage`]. Longer frames are dropped by
@@ -58,6 +58,11 @@ async fn wait_for_log_frame() {
 pub enum SessionEnd {
     /// The peer sent a [`Disconnect`] message.
     Disconnected,
+    /// The peer sent an [`Erase`] message. The TOFU keystore should be
+    /// erased (see [`crate::noise_link::KeyStore::erase`]) and the device's
+    /// static identity key regenerated before the link is restarted with a
+    /// fresh handshake.
+    Erased,
     /// A transport or protocol error occurred. The link should be
     /// restarted (see
     /// [`SecureLink::restart_responder`](crate::noise_link::SecureLink::restart_responder))
@@ -92,6 +97,15 @@ impl<T: Read + Write> SecureLink<T> {
         .await
     }
 
+    /// Sends an [`Erase`] message, telling the peer to end the session,
+    /// erase its TOFU keystore, and regenerate its static identity key.
+    pub async fn send_erase(&mut self) -> Result<(), Error> {
+        self.send_envelope(&Envelope {
+            r#msg: Some(Msg::Erase(Erase::default())),
+        })
+        .await
+    }
+
     /// Sends `data` (a single encoded `defmt` log frame) as a
     /// [`LogMessage`].
     pub async fn send_log_message(&mut self, data: &[u8]) -> Result<(), Error> {
@@ -112,16 +126,17 @@ impl<T: Read + Write> SecureLink<T> {
     }
 
     /// Handles a single received `envelope`. Replies to [`EchoRequest`]s
-    /// with an [`EchoResponse`] containing `value + 1`. Returns `true` if
-    /// `envelope` was a [`Disconnect`] message (the caller should stop the
-    /// session); other envelope types are ignored and return `false`.
+    /// with an [`EchoResponse`] containing `value + 1`. Returns the
+    /// [`SessionEnd`] the caller should stop the session with, if
+    /// `envelope` was a [`Disconnect`] or [`Erase`] message; other envelope
+    /// types are ignored and return `None`.
     ///
     /// # Panics
     ///
     /// Panics if `value + 1` overflows a `u64`. The host is expected not to
     /// send `u64::MAX`; if it does, this is treated as a fatal protocol
     /// error.
-    async fn handle_envelope(&mut self, envelope: Envelope) -> Result<bool, Error> {
+    async fn handle_envelope(&mut self, envelope: Envelope) -> Result<Option<SessionEnd>, Error> {
         match envelope.r#msg {
             Some(Msg::EchoRequest(request)) => {
                 let value = request
@@ -132,10 +147,11 @@ impl<T: Read + Write> SecureLink<T> {
                     r#msg: Some(Msg::EchoResponse(EchoResponse { r#value: value })),
                 })
                 .await?;
-                Ok(false)
+                Ok(None)
             }
-            Some(Msg::Disconnect(_)) => Ok(true),
-            _ => Ok(false),
+            Some(Msg::Disconnect(_)) => Ok(Some(SessionEnd::Disconnected)),
+            Some(Msg::Erase(_)) => Ok(Some(SessionEnd::Erased)),
+            _ => Ok(None),
         }
     }
 
@@ -164,8 +180,8 @@ impl<T: Read + Write> SecureLink<T> {
                         Err(e) => Err(e),
                     };
                     match result {
-                        Ok(true) => return SessionEnd::Disconnected,
-                        Ok(false) => {}
+                        Ok(Some(end)) => return end,
+                        Ok(None) => {}
                         Err(e) => {
                             #[cfg(target_os = "none")]
                             defmt::error!("session error: {}", e.message());

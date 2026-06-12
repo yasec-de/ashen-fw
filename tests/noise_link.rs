@@ -38,6 +38,7 @@ fn handshake_and_echo_round_trips() {
             // Handle three echo requests, then exit when the client disconnects.
             match link.run_session().await {
                 SessionEnd::Disconnected => {}
+                SessionEnd::Erased => panic!("unexpected SessionEnd::Erased"),
                 SessionEnd::Error(e) => panic!("unexpected session error: {e:?}"),
             }
         });
@@ -194,6 +195,7 @@ fn run_session_returns_error_on_disconnect() {
             match link.run_session().await {
                 SessionEnd::Error(_) => {}
                 SessionEnd::Disconnected => panic!("expected an error, got a clean disconnect"),
+                SessionEnd::Erased => panic!("expected an error, got SessionEnd::Erased"),
             }
         });
     });

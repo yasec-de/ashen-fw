@@ -2,7 +2,7 @@
 
 use std::thread;
 
-use ashen_fw::noise_link::{MemoryKeyStore, SecureLink, generate_keypair};
+use ashen_fw::noise_link::{KeyStore, MemoryKeyStore, SecureLink, generate_keypair};
 use ashen_fw::protocol::{EchoRequest, Envelope, Msg, SessionEnd};
 
 mod common;
@@ -26,6 +26,7 @@ fn echo_request_replies_with_value_plus_one() {
 
             match link.run_session().await {
                 SessionEnd::Disconnected => {}
+                SessionEnd::Erased => panic!("unexpected SessionEnd::Erased"),
                 SessionEnd::Error(e) => panic!("unexpected session error: {e:?}"),
             }
         });
@@ -85,6 +86,7 @@ fn send_log_message_round_trips() {
 
             match link.run_session().await {
                 SessionEnd::Disconnected => {}
+                SessionEnd::Erased => panic!("unexpected SessionEnd::Erased"),
                 SessionEnd::Error(e) => panic!("unexpected session error: {e:?}"),
             }
         });
@@ -112,6 +114,60 @@ fn send_log_message_round_trips() {
         }
 
         client.send_disconnect().await.expect("send disconnect failed");
+    });
+
+    server_thread.join().expect("server thread panicked");
+}
+
+/// An [`Erase`](ashen_fw::protocol::Erase) message ends the session like a
+/// [`Disconnect`], but the responder additionally has to erase its TOFU
+/// keystore (forgetting the previously-trusted remote static key).
+#[test]
+fn erase_request_ends_session_and_clears_keystore() {
+    let server_keys = generate_keypair(rng(0x1234_5678)).unwrap();
+    let client_keys = generate_keypair(rng(0x9876_5432_1234)).unwrap();
+    let client_public: [u8; 32] = client_keys.public.clone().try_into().unwrap();
+
+    let (client_io, server_io) = duplex_pair();
+
+    let server_static = server_keys.private.clone();
+    let server_thread = thread::spawn(move || {
+        embassy_futures::block_on(async move {
+            let mut keystore = MemoryKeyStore::default();
+            let mut link =
+                SecureLink::responder_handshake(server_io, &server_static, rng(0x00C0_FFEE), &mut keystore)
+                    .await
+                    .expect("server handshake failed");
+
+            // TOFU: the server learned the client's static key on this
+            // first handshake.
+            assert_eq!(keystore.trusted_key(), Some(client_public));
+
+            match link.run_session().await {
+                SessionEnd::Erased => {}
+                other => panic!("expected SessionEnd::Erased, got {other:?}"),
+            }
+
+            // The session handler itself doesn't erase the keystore; that's
+            // the caller's responsibility upon seeing `SessionEnd::Erased`
+            // (see `ashen_fw::main`'s session loop).
+            keystore.erase();
+            assert_eq!(keystore.trusted_key(), None);
+        });
+    });
+
+    embassy_futures::block_on(async move {
+        let mut client_keystore = MemoryKeyStore::default();
+        let mut client = SecureLink::initiator_handshake(
+            client_io,
+            &client_keys.private,
+            rng(0xDEAD_BEEF),
+            &mut client_keystore,
+        )
+        .await
+        .expect("client handshake failed");
+
+        client.send_erase().await.expect("send erase failed");
     });
 
     server_thread.join().expect("server thread panicked");

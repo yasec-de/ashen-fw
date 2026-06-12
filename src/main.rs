@@ -7,7 +7,7 @@ use alloc::boxed::Box;
 
 use ashen_fw::flash_keystore::FlashKeyStore;
 use ashen_fw::hw_rng::HwRng;
-use ashen_fw::noise_link::{Random, SecureLink, generate_keypair};
+use ashen_fw::noise_link::{KeyStore, Random, SecureLink, generate_keypair};
 use ashen_fw::protocol::SessionEnd;
 use embassy_executor::Spawner;
 use embassy_stm32::bind_interrupts;
@@ -79,7 +79,7 @@ async fn main(spawner: Spawner) {
     // This boot's ephemeral local keypair.
     // SAFETY: this `HwRng` is fully consumed by `generate_keypair` before
     // any other handle to the RNG peripheral is created.
-    let local_keys = generate_keypair(unsafe { boxed_hw_rng(&p.RNG) }).expect("local keypair generation failed");
+    let mut local_keys = generate_keypair(unsafe { boxed_hw_rng(&p.RNG) }).expect("local keypair generation failed");
 
     let mut usart_config = UsartConfig::default();
     usart_config.baudrate = 1_000_000;
@@ -121,6 +121,15 @@ async fn main(spawner: Spawner) {
             // Either way, restart the link with a fresh handshake: the
             // peer is expected to reconnect.
             SessionEnd::Disconnected | SessionEnd::Error(_) => {
+                // SAFETY: see `boxed_hw_rng`.
+                let rng = unsafe { boxed_hw_rng(&p.RNG) };
+                let _ = link.restart_responder(&local_keys.private, rng, &mut keystore).await;
+            }
+            SessionEnd::Erased => {
+                keystore.erase();
+                // SAFETY: see `boxed_hw_rng`.
+                local_keys = generate_keypair(unsafe { boxed_hw_rng(&p.RNG) })
+                    .expect("local keypair generation failed");
                 // SAFETY: see `boxed_hw_rng`.
                 let rng = unsafe { boxed_hw_rng(&p.RNG) };
                 let _ = link.restart_responder(&local_keys.private, rng, &mut keystore).await;

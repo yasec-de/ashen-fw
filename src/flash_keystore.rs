@@ -107,4 +107,15 @@ impl KeyStore for FlashKeyStore<'_> {
 
         self.cached = Some(key);
     }
+
+    fn erase(&mut self) {
+        let ptr = KEYSTORE_RECORD.as_ptr();
+        let page_start = ptr as u32 - FLASH_BASE as u32;
+
+        self.flash
+            .blocking_erase(page_start, page_start + MAX_ERASE_SIZE as u32)
+            .expect("flash erase failed while erasing TOFU key");
+
+        self.cached = None;
+    }
 }

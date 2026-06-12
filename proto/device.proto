@@ -13,6 +13,7 @@ message Envelope {
     EchoResponse echo_response = 4;
     Disconnect disconnect = 5;
     LogMessage log = 6;
+    Erase erase = 7;
   }
 }
 
@@ -20,6 +21,13 @@ message Envelope {
 // messages on this link; the device restarts the link with a fresh
 // handshake.
 message Disconnect {
+}
+
+// Sent from the host to the device. Like `Disconnect`, but additionally
+// tells the device to erase its TOFU keystore (forgetting the host's static
+// key) and generate a fresh per-boot static identity key before restarting
+// the link with a new handshake.
+message Erase {
 }
 
 // Sent from the host to the device. The device replies with an

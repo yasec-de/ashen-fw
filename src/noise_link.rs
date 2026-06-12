@@ -81,6 +81,8 @@ pub trait KeyStore {
     fn trusted_key(&self) -> Option<[u8; 32]>;
     /// Records `key` as the trusted remote static key.
     fn trust(&mut self, key: [u8; 32]);
+    /// Forgets the previously trusted remote static key, if any.
+    fn erase(&mut self);
 }
 
 /// A simple in-memory [`KeyStore`].
@@ -97,6 +99,10 @@ impl KeyStore for MemoryKeyStore {
 
     fn trust(&mut self, key: [u8; 32]) {
         self.0 = Some(key);
+    }
+
+    fn erase(&mut self) {
+        self.0 = None;
     }
 }
 
