@@ -7,7 +7,7 @@
 
 use std::thread;
 
-use ashen_fw::noise_link::{Error, KeyStore, MemoryKeyStore, SecureLink, generate_keypair};
+use ashen_fw::noise_link::{Error, KeyStore, TestKeyStore, SecureLink, generate_keypair};
 use ashen_fw::protocol::{EchoRequest, Envelope, Msg, SessionEnd};
 
 mod common;
@@ -24,7 +24,7 @@ fn handshake_and_echo_round_trips() {
     let server_static = server_keys.private.clone();
     let server_thread = thread::spawn(move || {
         embassy_futures::block_on(async move {
-            let mut keystore = MemoryKeyStore::default();
+            let mut keystore = TestKeyStore::default();
             let mut link =
                 SecureLink::responder_handshake(server_io, &server_static, rng(0x00C0_FFEE), &mut keystore)
                     .await
@@ -45,7 +45,7 @@ fn handshake_and_echo_round_trips() {
     });
 
     embassy_futures::block_on(async move {
-        let mut client_keystore = MemoryKeyStore::default();
+        let mut client_keystore = TestKeyStore::default();
         let mut client = SecureLink::initiator_handshake(
             client_io,
             &client_keys.private,
@@ -93,7 +93,7 @@ fn handshake_rejects_mismatched_remote_static_key() {
     let server_b_keys = generate_keypair(rng(0x5555_5555_5555)).unwrap();
     let client_keys = generate_keypair(rng(0x9876_5432_1234)).unwrap();
 
-    let mut client_keystore = MemoryKeyStore::default();
+    let mut client_keystore = TestKeyStore::default();
 
     // First connection: client trusts server A's static key via TOFU.
     {
@@ -101,7 +101,7 @@ fn handshake_rejects_mismatched_remote_static_key() {
         let server_a_static = server_a_keys.private.clone();
         let server_thread = thread::spawn(move || {
             embassy_futures::block_on(async move {
-                let mut keystore = MemoryKeyStore::default();
+                let mut keystore = TestKeyStore::default();
                 let _link = SecureLink::responder_handshake(
                     server_io,
                     &server_a_static,
@@ -137,7 +137,7 @@ fn handshake_rejects_mismatched_remote_static_key() {
         let server_b_static = server_b_keys.private.clone();
         let server_thread = thread::spawn(move || {
             embassy_futures::block_on(async move {
-                let mut keystore = MemoryKeyStore::default();
+                let mut keystore = TestKeyStore::default();
                 // The responder side completes its own handshake fine; only
                 // the initiator (client) has a pre-existing trust record to
                 // violate.
@@ -184,7 +184,7 @@ fn run_session_returns_error_on_disconnect() {
     let server_static = server_keys.private.clone();
     let server_thread = thread::spawn(move || {
         embassy_futures::block_on(async move {
-            let mut keystore = MemoryKeyStore::default();
+            let mut keystore = TestKeyStore::default();
             let mut link =
                 SecureLink::responder_handshake(server_io, &server_static, rng(0xAAAA_AAAA), &mut keystore)
                     .await
@@ -201,7 +201,7 @@ fn run_session_returns_error_on_disconnect() {
     });
 
     embassy_futures::block_on(async move {
-        let mut client_keystore = MemoryKeyStore::default();
+        let mut client_keystore = TestKeyStore::default();
         let mut client = SecureLink::initiator_handshake(
             client_io,
             &client_keys.private,

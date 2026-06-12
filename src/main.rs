@@ -7,7 +7,7 @@ use alloc::boxed::Box;
 
 use ashen_fw::flash_keystore::FlashKeyStore;
 use ashen_fw::hw_rng::HwRng;
-use ashen_fw::noise_link::{KeyStore, Random, SecureLink, generate_keypair};
+use ashen_fw::noise_link::{KeyStore, Random, NoiseLink, generate_keypair};
 use ashen_fw::protocol::SessionEnd;
 use embassy_executor::Spawner;
 use embassy_stm32::bind_interrupts;
@@ -21,7 +21,7 @@ use static_cell::StaticCell;
 
 // `ashen_fw::defmt_link` provides the `defmt` global logger, which tees log
 // frames to RTT (for probe-rs) and to a queue forwarded over the secure
-// Noise channel by `SecureLink::run_session`.
+// Noise channel by `NoiseLink::run_session`.
 #[allow(unused_imports)]
 use ashen_fw::defmt_link as _;
 
@@ -100,11 +100,11 @@ async fn main(spawner: Spawner) {
     // SAFETY: see `boxed_hw_rng`; this handle is fully consumed by the
     // handshake before the next one is created in the loop below.
     let handshake_rng = unsafe { boxed_hw_rng(&p.RNG) };
-    let link = SecureLink::responder_handshake(uart, &local_keys.private, handshake_rng, &mut keystore)
+    let link = NoiseLink::responder_handshake(uart, &local_keys.private, handshake_rng, &mut keystore)
         .await
         .expect("handshake failed");
 
-    static LINK: StaticCell<SecureLink<BufferedUart<'static>>> = StaticCell::new();
+    static LINK: StaticCell<NoiseLink<BufferedUart<'static>>> = StaticCell::new();
     let link = LINK.init(link);
 
     // SAFETY: this creates a second `&'static mut` alias of `link`, used
@@ -113,7 +113,7 @@ async fn main(spawner: Spawner) {
     // `ashen_fw::panic_link`), at which point the session loop below can no
     // longer be touching `link`, so the two references are never live at
     // the same time.
-    let panic_link: &'static mut SecureLink<BufferedUart<'static>> = unsafe { &mut *(link as *mut _) };
+    let panic_link: &'static mut NoiseLink<BufferedUart<'static>> = unsafe { &mut *(link as *mut _) };
     ashen_fw::panic_link::register(panic_link);
 
     loop {

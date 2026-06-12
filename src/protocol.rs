@@ -54,7 +54,7 @@ async fn wait_for_log_frame() {
 }
 
 /// Why [`SecureLink::run_session`] returned.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum SessionEnd {
     /// The peer sent a [`Disconnect`] message.
     Disconnected,
@@ -168,8 +168,6 @@ impl<T: Read + Write> SecureLink<T> {
     pub async fn run_session(&mut self) -> SessionEnd {
         loop {
             if let Err(e) = self.flush_log_queue().await {
-                #[cfg(target_os = "none")]
-                defmt::error!("session error: {}", e.message());
                 return SessionEnd::Error(e);
             }
 
@@ -183,8 +181,6 @@ impl<T: Read + Write> SecureLink<T> {
                         Ok(Some(end)) => return end,
                         Ok(None) => {}
                         Err(e) => {
-                            #[cfg(target_os = "none")]
-                            defmt::error!("session error: {}", e.message());
                             return SessionEnd::Error(e);
                         }
                     }

@@ -2,38 +2,55 @@ syntax = "proto3";
 
 package ashen;
 
-// A single message exchanged between host and device over the secure Noise
-// transport. Exactly one field is set.
-//
-// This is intentionally extensible: future commands sent by the host (and
-// their responses) will be added as additional `Envelope` fields.
 message Envelope {
   oneof msg {
-    EchoRequest echo_request = 3;
-    EchoResponse echo_response = 4;
-    Disconnect disconnect = 5;
-    LogMessage log = 6;
-    Erase erase = 7;
+    LogMessage log = 1;
+    Erase erase = 2;
+    Pair pair = 3;
+    IsKeyed is_keyed = 4;
+    IsKeyedResponse is_keyed_response = 5;
+    Disconnect disconnect = 6;
+    EchoRequest echo_request = 7;
+    EchoResponse echo_response = 8;
   }
 }
 
+// A single defmt-encoded log frame, sent spontaneously by the device
+// whenever it has queued log output and isn't otherwise busy sending to the
+// host.
+message LogMessage {
+  bytes data = 1;
+}
+
+// Sent from the host to the device. Tells the device to erase all keys.
+// This will reset the cached host key, and re-generate the device's long-term
+// identity key. Disconnects the session like Disconnect.
+message Erase {
+}
+
+// Sent from the host to the device. Tells the device to commit this host's
+// long-term identity key to its key store. Can only be run on an Erase'd device.
+message Pair {
+}
+
+// Sent from host to the device. A command requesting if the device is keyed,
+// i.e. is paired to a trusted peer already.
+message IsKeyed {
+}
+
+// The device's reply to IsKeyed
+message IsKeyedResponse {
+  bool is_keyed = 1;
+}
+
 // Sent by either side to end the session. The receiver stops processing
-// messages on this link; the device restarts the link with a fresh
+// messages on this link and restarts the link with a fresh
 // handshake.
 message Disconnect {
 }
 
-// Sent from the host to the device. Like `Disconnect`, but additionally
-// tells the device to erase its TOFU keystore (forgetting the host's static
-// key) and generate a fresh per-boot static identity key before restarting
-// the link with a new handshake.
-message Erase {
-}
-
 // Sent from the host to the device. The device replies with an
-// `EchoResponse` containing `value + 1`. Overflowing this addition is a
-// firmware bug (the host is expected not to send `UINT64_MAX`) and triggers
-// a panic.
+// `EchoResponse` containing `value + 1`. Overflow triggers a panic.
 message EchoRequest {
   uint64 value = 1;
 }
@@ -41,18 +58,4 @@ message EchoRequest {
 // Sent from the device to the host in response to an `EchoRequest`.
 message EchoResponse {
   uint64 value = 1;
-}
-
-// A single defmt-encoded log frame, sent spontaneously by the device
-// whenever it has queued log output and isn't otherwise busy sending to the
-// host. Concatenating the `data` of successive `LogMessage`s, in the order
-// received, yields a defmt byte stream decodable with the firmware's
-// `.elf` (the same data is also available live via RTT/probe-rs).
-//
-// This is also how the device reports informational status updates (e.g.
-// TOFU key trust decisions) and errors (e.g. firmware panics): those are
-// logged via `defmt` like any other log message, rather than as separate
-// envelope types.
-message LogMessage {
-  bytes data = 1;
 }

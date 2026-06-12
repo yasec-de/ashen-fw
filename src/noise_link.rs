@@ -11,6 +11,7 @@ use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
+use std::fmt;
 
 use embedded_io_async::{Read, Write};
 use subtle::ConstantTimeEq;
@@ -25,85 +26,41 @@ use crate::cobs;
 /// Noise handshake pattern used for this link.
 pub const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
 
-/// Maximum number of plaintext payload bytes carried by a single
-/// [`SecureLink::send`]/[`SecureLink::receive`] call.
-pub const MAX_PAYLOAD_LEN: usize = 1024;
 
-/// Maximum size (in bytes) of a COBS-encoded frame (including the Noise
-/// authentication tag, but excluding the trailing `0x00` delimiter) that
-/// [`read_frame`] will accept before giving up and resynchronizing.
-const MAX_FRAME_LEN: usize = MAX_PAYLOAD_LEN + 16 + (MAX_PAYLOAD_LEN + 16) / 254 + 2;
-
-/// Errors that can occur while operating a [`SecureLink`].
-#[derive(Debug, Clone, Copy)]
+/// Errors that can occur while operating a [`NoiseLink`].
+#[derive(Debug, Clone)]
 pub enum Error {
-    /// The underlying transport failed.
-    Io,
-    /// A frame could not be decoded (bad COBS framing or oversized payload).
-    Framing,
-    /// A payload was too large to fit in a single frame.
-    PayloadTooLarge,
-    /// The Noise protocol returned an error (handshake or crypto failure).
-    Crypto,
-    /// The remote static key did not match the previously trusted key.
+    Transport(cobs::Error),
+    Crypto(snow::Error),
     UntrustedPeer,
 }
 
-impl Error {
-    /// A short, human-readable description of this error, prefixed with a
-    /// broad category (e.g. `"io: framing error"`), for use with defmt
-    /// logging.
-    pub fn message(&self) -> &'static str {
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Error::Io => "io: transport error",
-            Error::Framing => "io: framing error",
-            Error::PayloadTooLarge => "io: payload too large",
-            Error::Crypto => "crypto: noise protocol error",
-            Error::UntrustedPeer => "crypto: untrusted peer",
+            Error::Transport(e) => write!(f, "Transport error: {}", e),
+            Error::CryptO(e) => write!(f, "Noise protocol error: {}", e),
         }
     }
 }
 
 impl From<snow::Error> for Error {
-    fn from(_: snow::Error) -> Self {
-        Error::Crypto
+    fn from(e: snow::Error) -> Self {
+        Error::Crypto(e)
     }
 }
 
-/// Storage for the trust-on-first-use remote static public key.
-///
-/// On the first successful handshake, the remote's static public key is
-/// recorded via [`KeyStore::trust`]. On subsequent handshakes, the
-/// presented key is compared against the stored one; a mismatch is
-/// reported as [`Error::UntrustedPeer`].
+impl From<cobs::Error> for Error {
+    fn from(e: cobs::Error) -> Self {
+        Error::Transport(e)
+    }
+}
+
+/// Storage for the remote long-term identity key.
 pub trait KeyStore {
-    /// Returns the previously trusted remote static key, if any.
     fn trusted_key(&self) -> Option<[u8; 32]>;
-    /// Records `key` as the trusted remote static key.
     fn trust(&mut self, key: [u8; 32]);
-    /// Forgets the previously trusted remote static key, if any.
     fn erase(&mut self);
-}
-
-/// A simple in-memory [`KeyStore`].
-///
-/// Useful for tests, or as a starting point for an embedded implementation
-/// that persists the key to flash.
-#[derive(Default)]
-pub struct MemoryKeyStore(Option<[u8; 32]>);
-
-impl KeyStore for MemoryKeyStore {
-    fn trusted_key(&self) -> Option<[u8; 32]> {
-        self.0
-    }
-
-    fn trust(&mut self, key: [u8; 32]) {
-        self.0 = Some(key);
-    }
-
-    fn erase(&mut self) {
-        self.0 = None;
-    }
 }
 
 /// A [`snow::resolvers::CryptoResolver`] that delegates DH/hash/cipher
@@ -154,154 +111,19 @@ fn builder(rng: Box<dyn Random>) -> Result<Builder<'static>, Error> {
 }
 
 /// Generates a new static Curve25519 keypair for use with
-/// [`SecureLink::responder_handshake`].
+/// [`NoiseLink::responder_handshake`].
 pub fn generate_keypair(rng: Box<dyn Random>) -> Result<snow::Keypair, Error> {
     Ok(builder(rng)?.generate_keypair()?)
 }
 
-/// COBS-encodes `payload` and writes it followed by the `0x00` delimiter.
-async fn write_frame<T: Write>(io: &mut T, payload: &[u8]) -> Result<(), Error> {
-    let mut frame = cobs::encode(payload);
-    frame.push(0x00);
-    io.write_all(&frame).await.map_err(|_| Error::Io)
-}
-
-/// Reads bytes up to the next `0x00` delimiter and COBS-decodes them.
-///
-/// If the frame is malformed or exceeds [`MAX_FRAME_LEN`], bytes are still
-/// consumed up to (and including) the delimiter before returning
-/// [`Error::Framing`], so the next call starts cleanly at the following
-/// frame.
-async fn read_frame<T: Read>(io: &mut T) -> Result<Vec<u8>, Error> {
-    let mut buf = Vec::new();
-    let mut overflow = false;
-    loop {
-        let mut byte = [0u8; 1];
-        io.read_exact(&mut byte).await.map_err(|_| Error::Io)?;
-        if byte[0] == 0x00 {
-            break;
-        }
-        if buf.len() < MAX_FRAME_LEN {
-            buf.push(byte[0]);
-        } else {
-            overflow = true;
-        }
-    }
-    if overflow {
-        return Err(Error::Framing);
-    }
-    cobs::decode(&buf).map_err(|_| Error::Framing)
-}
-
-/// Performs the responder side of a Noise_XX handshake (`<- e, ee, s, es`
-/// then `-> s, se`) over `io`, verifying the initiator's static key against
-/// `keystore` via TOFU.
-///
-/// Returns the resulting [`TransportState`], the verified remote static key,
-/// and whether it was newly trusted (see [`verify_remote_static`]).
-async fn do_responder_handshake<T: Read + Write, K: KeyStore>(
-    io: &mut T,
-    local_static_key: &[u8],
-    rng: Box<dyn Random>,
-    keystore: &mut K,
-) -> Result<(TransportState, [u8; 32], bool), Error> {
-    let mut hs = builder(rng)?
-        .local_private_key(local_static_key)?
-        .build_responder()?;
-
-    let mut buf = vec![0u8; MAX_PAYLOAD_LEN + 16];
-
-    // -> e
-    let msg = read_frame(io).await?;
-    hs.read_message(&msg, &mut buf)?;
-
-    // <- e, ee, s, es
-    let len = hs.write_message(&[], &mut buf)?;
-    write_frame(io, &buf[..len]).await?;
-
-    // -> s, se
-    let msg = read_frame(io).await?;
-    hs.read_message(&msg, &mut buf)?;
-
-    let (remote_static, newly_trusted) = verify_remote_static(&hs, keystore)?;
-    let transport = hs.into_transport_mode()?;
-    Ok((transport, remote_static, newly_trusted))
-}
-
-/// Performs the initiator side of a Noise_XX handshake (`-> e` then `<- e,
-/// ee, s, es` then `-> s, se`) over `io`, verifying the responder's static
-/// key against `keystore` via TOFU.
-///
-/// Returns the resulting [`TransportState`], the verified remote static key,
-/// and whether it was newly trusted (see [`verify_remote_static`]).
-///
-/// The firmware only ever acts as the responder; this side is only used by
-/// the host-side test harness to simulate the firmware's peer.
-#[cfg(feature = "test-util")]
-async fn do_initiator_handshake<T: Read + Write, K: KeyStore>(
-    io: &mut T,
-    local_static_key: &[u8],
-    rng: Box<dyn Random>,
-    keystore: &mut K,
-) -> Result<(TransportState, [u8; 32], bool), Error> {
-    let mut hs = builder(rng)?
-        .local_private_key(local_static_key)?
-        .build_initiator()?;
-
-    let mut buf = vec![0u8; MAX_PAYLOAD_LEN + 16];
-
-    // -> e
-    let len = hs.write_message(&[], &mut buf)?;
-    write_frame(io, &buf[..len]).await?;
-
-    // <- e, ee, s, es
-    let msg = read_frame(io).await?;
-    hs.read_message(&msg, &mut buf)?;
-
-    // -> s, se
-    let len = hs.write_message(&[], &mut buf)?;
-    write_frame(io, &buf[..len]).await?;
-
-    let (remote_static, newly_trusted) = verify_remote_static(&hs, keystore)?;
-    let transport = hs.into_transport_mode()?;
-    Ok((transport, remote_static, newly_trusted))
-}
-
-/// Logs the outcome of TOFU remote static key verification via `defmt`.
-/// Forwarded to the host as a [`crate::protocol::LogMessage`] like any other
-/// log frame.
-#[cfg(target_os = "none")]
-fn log_tofu_status(newly_trusted: bool) {
-    if newly_trusted {
-        defmt::info!("TOFU: trusted new remote static key");
-    } else {
-        defmt::info!("TOFU: remote static key validated");
-    }
-}
-
-#[cfg(not(target_os = "none"))]
-fn log_tofu_status(_newly_trusted: bool) {}
-
-/// A handshake-completed Noise_XX link over a COBS-framed byte transport.
-///
-/// Both sides of the link use the same API after the handshake: call
-/// [`SecureLink::send`]/[`SecureLink::receive`] (or
-/// [`SecureLink::request`]) to exchange authenticated, encrypted messages,
-/// or [`SecureLink::run_session`] to handle a full
-/// [`crate::protocol`] session.
-///
-/// If [`SecureLink::run_session`] ends (the peer disconnected, or an error
-/// occurred), the link can be put back into a working state without
-/// reallocating the underlying transport by calling
-/// [`SecureLink::restart_responder`].
-pub struct SecureLink<T> {
+pub struct NoiseLink<T> {
     io: T,
     transport: TransportState,
-    /// The remote party's static public key, as verified by TOFU.
+    peer_trusted: bool,
     pub remote_static: [u8; 32],
 }
 
-impl<T: Read + Write> SecureLink<T> {
+impl<T: Read + Write> NoiseLink<T> {
     /// Performs the responder side of a Noise_XX handshake (`<- e, ee, s,
     /// es` then `-> s, se`), verifying the initiator's static key against
     /// `keystore` via TOFU.
@@ -311,99 +133,52 @@ impl<T: Read + Write> SecureLink<T> {
         rng: Box<dyn Random>,
         keystore: &mut K,
     ) -> Result<Self, Error> {
-        let (transport, remote_static, newly_trusted) =
-            do_responder_handshake(&mut io, local_static_key, rng, keystore).await?;
+        let mut hs = builder(rng)?
+            .local_private_key(local_static_key)?
+            .build_responder()?;
 
-        let link = Self {
-            io,
-            transport,
-            remote_static,
+        let mut buf = vec![0u8; cobs::MAX_PAYLOAD_LEN + 16];
+
+        // -> e
+        let msg = cobs::read_frame(io).await?;
+        hs.read_message(&msg, &mut buf)?;
+
+        // <- e, ee, s, es
+        let len = hs.write_message(&[], &mut buf)?;
+        cobs::write_frame(io, &buf[..len]).await?;
+
+        // -> s, se
+        let msg = cobs::read_frame(io).await?;
+        hs.read_message(&msg, &mut buf)?;
+
+
+        let remote_static = hs.get_remote_static().ok_or(Error::Crypto)?;
+        let mut key = [0u8; 32];
+        key.copy_from_slice(remote_static);
+
+        let trusted = match keystore.trusted_key() {
+            Some(trusted) => trusted.ct_eq(&key).into(),
+            None => false,
         };
-        log_tofu_status(newly_trusted);
-        Ok(link)
-    }
 
-    /// Performs the initiator side of a Noise_XX handshake (`-> e` then `<-
-    /// e, ee, s, es` then `-> s, se`), verifying the responder's static key
-    /// against `keystore` via TOFU.
-    ///
-    /// The firmware only ever acts as the responder; this side is only used
-    /// by the host-side test harness to simulate the firmware's peer.
-    #[cfg(feature = "test-util")]
-    pub async fn initiator_handshake<K: KeyStore>(
-        mut io: T,
-        local_static_key: &[u8],
-        rng: Box<dyn Random>,
-        keystore: &mut K,
-    ) -> Result<Self, Error> {
-        let (transport, remote_static, newly_trusted) =
-            do_initiator_handshake(&mut io, local_static_key, rng, keystore).await?;
-
-        let link = Self {
-            io,
-            transport,
-            remote_static,
-        };
-        log_tofu_status(newly_trusted);
-        Ok(link)
-    }
-
-    /// Re-runs the responder handshake on this link's existing transport,
-    /// replacing its transport state and [`SecureLink::remote_static`] in
-    /// place.
-    ///
-    /// Used to restart a session (after [`SecureLink::run_session`] returns
-    /// due to a disconnect or error) without losing the link's `'static`
-    /// identity, e.g. a [`crate::panic_link`] registration pointing at this
-    /// link remains valid.
-    pub async fn restart_responder<K: KeyStore>(
-        &mut self,
-        local_static_key: &[u8],
-        rng: Box<dyn Random>,
-        keystore: &mut K,
-    ) -> Result<(), Error> {
-        let (transport, remote_static, newly_trusted) =
-            do_responder_handshake(&mut self.io, local_static_key, rng, keystore).await?;
-        self.transport = transport;
-        self.remote_static = remote_static;
-        log_tofu_status(newly_trusted);
-        Ok(())
-    }
-
-    /// Re-runs the initiator handshake on this link's existing transport,
-    /// replacing its transport state and [`SecureLink::remote_static`] in
-    /// place. See [`SecureLink::restart_responder`].
-    ///
-    /// The firmware only ever acts as the responder; this side is only used
-    /// by the host-side test harness to simulate the firmware's peer.
-    #[cfg(feature = "test-util")]
-    pub async fn restart_initiator<K: KeyStore>(
-        &mut self,
-        local_static_key: &[u8],
-        rng: Box<dyn Random>,
-        keystore: &mut K,
-    ) -> Result<(), Error> {
-        let (transport, remote_static, newly_trusted) =
-            do_initiator_handshake(&mut self.io, local_static_key, rng, keystore).await?;
-        self.transport = transport;
-        self.remote_static = remote_static;
-        log_tofu_status(newly_trusted);
-        Ok(())
+        let transport = hs.into_transport_mode()?;
+        Ok(Self(io, transport, trusted, remote_static))
     }
 
     /// Encrypts and sends `payload` as a single transport message.
     pub async fn send(&mut self, payload: &[u8]) -> Result<(), Error> {
-        if payload.len() > MAX_PAYLOAD_LEN {
-            return Err(Error::PayloadTooLarge);
-        }
         let mut cipher = vec![0u8; payload.len() + 16];
         let len = self.transport.write_message(payload, &mut cipher)?;
-        write_frame(&mut self.io, &cipher[..len]).await
+        match cobs::write_frame(&mut self.io, &cipher[..len]).await {
+            Ok(v) => Ok(v),
+            Err(cobs::Error::Overflow) => panic!("Overflow encoding outgoing payload"),
+            Err(e) => Err(Error::Transport(e)),
+        }
     }
 
     /// Receives and decrypts a single transport message.
     pub async fn receive(&mut self) -> Result<Vec<u8>, Error> {
-        let msg = read_frame(&mut self.io).await?;
+        let msg = cobs::read_frame(&mut self.io).await?;
         let mut plain = vec![0u8; msg.len()];
         let len = self.transport.read_message(&msg, &mut plain)?;
         plain.truncate(len);
@@ -415,31 +190,6 @@ impl<T: Read + Write> SecureLink<T> {
         self.send(request).await?;
         self.receive().await
     }
-}
-
-/// Verifies the handshake's remote static key against `keystore` via TOFU.
-///
-/// Returns the remote static key, and whether it was newly trusted (i.e.
-/// this is the first time this peer has connected) as opposed to matching a
-/// previously trusted key.
-fn verify_remote_static<K: KeyStore>(
-    hs: &snow::HandshakeState,
-    keystore: &mut K,
-) -> Result<([u8; 32], bool), Error> {
-    let remote_static = hs.get_remote_static().ok_or(Error::Crypto)?;
-    let mut key = [0u8; 32];
-    key.copy_from_slice(remote_static);
-
-    let newly_trusted = match keystore.trusted_key() {
-        Some(trusted) if trusted.ct_eq(&key).into() => false,
-        Some(_) => return Err(Error::UntrustedPeer),
-        None => {
-            keystore.trust(key);
-            true
-        }
-    };
-
-    Ok((key, newly_trusted))
 }
 
 #[cfg(test)]
@@ -456,12 +206,21 @@ mod tests {
         Box::new(XorShiftRng::new(TEST_RNG_SEED))
     }
 
-    #[test]
-    fn keypair_generation_is_deterministic_for_fixed_seed() {
-        let a = generate_keypair(test_rng()).unwrap();
-        let b = generate_keypair(test_rng()).unwrap();
-        assert_eq!(a.private, b.private);
-        assert_eq!(a.public, b.public);
+    #[derive(Default)]
+    pub struct TestKeyStore(Option<[u8; 32]>);
+    
+    impl KeyStore for TestKeyStore {
+        fn trusted_key(&self) -> Option<[u8; 32]> {
+            self.0
+        }
+
+        fn trust(&mut self, key: [u8; 32]) {
+            self.0 = Some(key);
+        }
+
+        fn erase(&mut self) {
+            self.0 = None;
+        }
     }
 
     /// An in-memory byte source/sink for testing [`read_frame`]/[`write_frame`].
@@ -516,14 +275,51 @@ mod tests {
         }
     }
 
+    impl<T: Read + Write> NoiseLink<T> {
+        pub async fn initiator_handshake<K: KeyStore>(
+            mut io: T,
+            local_static_key: &[u8],
+            rng: Box<dyn Random>,
+            keystore: &mut K,
+        ) -> Result<Self, Error> {
+            let mut hs = builder(rng)?
+                .local_private_key(local_static_key)?
+                .build_initiator()?;
+
+            let mut buf = vec![0u8; cobs::MAX_PAYLOAD_LEN + 16];
+
+            // -> e
+            let len = hs.write_message(&[], &mut buf)?;
+            cobs::write_frame(io, &buf[..len]).await?;
+
+            // <- e, ee, s, es
+            let msg = cobs::read_frame(io).await?;
+            hs.read_message(&msg, &mut buf)?;
+
+            // -> s, se
+            let len = hs.write_message(&[], &mut buf)?;
+            cobs::write_frame(io, &buf[..len]).await?;
+
+            let transport = hs.into_transport_mode()?;
+            let link = Self {
+                io,
+                transport,
+                true,
+                remote_static,
+            };
+            log_tofu_status(newly_trusted);
+            Ok(link)
+        }
+    }
+
     #[test]
     fn frame_round_trip() {
         embassy_futures::block_on(async {
             let mut io = SliceIo::new(Vec::new());
-            write_frame(&mut io, b"hello world").await.unwrap();
+            cobs::write_frame(&mut io, b"hello world").await.unwrap();
 
             let mut reader = SliceIo::new(io.out);
-            let frame = read_frame(&mut reader).await.unwrap();
+            let frame = cobs::read_frame(&mut reader).await.unwrap();
             assert_eq!(frame, b"hello world");
         });
     }
@@ -542,10 +338,10 @@ mod tests {
             let mut io = SliceIo::new(data);
 
             // First frame is corrupt.
-            assert!(matches!(read_frame(&mut io).await, Err(Error::Framing)));
+            assert!(matches!(cobs::read_frame(&mut io).await, Err(Error::Framing)));
 
             // Reader has resynchronized and can decode the next frame.
-            let frame = read_frame(&mut io).await.unwrap();
+            let frame = cobs::read_frame(&mut io).await.unwrap();
             assert_eq!(frame, b"second frame");
         });
     }
@@ -568,9 +364,9 @@ mod tests {
 
             let mut io = SliceIo::new(data);
 
-            assert!(matches!(read_frame(&mut io).await, Err(Error::Framing)));
+            assert!(matches!(cobs::read_frame(&mut io).await, Err(Error::Framing)));
 
-            let frame = read_frame(&mut io).await.unwrap();
+            let frame = cobs::read_frame(&mut io).await.unwrap();
             assert_eq!(frame, b"after overflow");
         });
     }
