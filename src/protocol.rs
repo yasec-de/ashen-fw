@@ -1,8 +1,8 @@
 //! Protobuf-encoded messages exchanged between host and device over a
-//! [`SecureLink`](crate::noise_link::SecureLink).
+//! [`NoiseLink`](crate::noise_link::NoiseLink).
 //!
-//! Each [`SecureLink::send`](crate::noise_link::SecureLink::send)/
-//! [`receive`](crate::noise_link::SecureLink::receive) call carries exactly
+//! Each [`NoiseLink::send`](crate::noise_link::NoiseLink::send)/
+//! [`receive`](crate::noise_link::NoiseLink::receive) call carries exactly
 //! one protobuf-encoded [`Envelope`]. Status updates and error reports are
 //! sent as `defmt`-encoded [`LogMessage`] frames (see
 //! [`crate::defmt_link`]); host-to-device commands and their responses will
@@ -14,7 +14,7 @@ use embassy_futures::select::{Either, select};
 use embedded_io_async::{Read, Write};
 use micropb::{MessageDecode, MessageEncode, PbEncoder};
 
-use crate::noise_link::{Error, SecureLink};
+use crate::noise_link::{Error, NoiseLink};
 
 #[allow(nonstandard_style, unused, irrefutable_let_patterns, clippy::all)]
 mod device_pb {
@@ -53,8 +53,8 @@ async fn wait_for_log_frame() {
     core::future::pending().await
 }
 
-/// Why [`SecureLink::run_session`] returned.
-#[derive(Debug, Clone)]
+/// Why [`NoiseLink::run_session`] returned.
+#[derive(Debug)]
 pub enum SessionEnd {
     /// The peer sent a [`Disconnect`] message.
     Disconnected,
@@ -65,17 +65,17 @@ pub enum SessionEnd {
     Erased,
     /// A transport or protocol error occurred. The link should be
     /// restarted (see
-    /// [`SecureLink::restart_responder`](crate::noise_link::SecureLink::restart_responder))
+    /// [`NoiseLink::restart_responder`](crate::noise_link::NoiseLink::restart_responder))
     /// with a fresh handshake.
     Error(Error),
 }
 
-impl<T: Read + Write> SecureLink<T> {
+impl<T: Read + Write> NoiseLink<T> {
     /// Encodes `envelope` as protobuf and sends it as a single transport
     /// message.
     pub async fn send_envelope(&mut self, envelope: &Envelope) -> Result<(), Error> {
         let mut encoder = PbEncoder::new(Vec::new());
-        envelope.encode(&mut encoder).map_err(|_| Error::Crypto)?;
+        envelope.encode(&mut encoder).map_err(|_| Error::Protocol)?;
         self.send(encoder.as_writer()).await
     }
 
@@ -85,7 +85,7 @@ impl<T: Read + Write> SecureLink<T> {
         let mut envelope = Envelope::default();
         envelope
             .decode_from_bytes(&payload)
-            .map_err(|_| Error::Crypto)?;
+            .map_err(|_| Error::Protocol)?;
         Ok(envelope)
     }
 
@@ -156,11 +156,11 @@ impl<T: Read + Write> SecureLink<T> {
     }
 
     /// Receives and handles envelopes (see
-    /// [`SecureLink::handle_envelope`](Self::handle_envelope)) until the
+    /// [`NoiseLink::handle_envelope`](Self::handle_envelope)) until the
     /// peer sends a [`Disconnect`] message or an error occurs.
     ///
     /// Draining the `defmt` log queue (forwarded to the host as
-    /// [`LogMessage`] envelopes, see [`SecureLink::flush_log_queue`]) and
+    /// [`LogMessage`] envelopes, see [`NoiseLink::flush_log_queue`]) and
     /// receiving protocol messages from the host both run concurrently:
     /// while waiting to receive the next envelope, a newly queued log frame
     /// wakes this loop so it can be flushed without waiting for the next

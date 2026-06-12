@@ -2,7 +2,8 @@
 
 use std::thread;
 
-use ashen_fw::noise_link::{KeyStore, MemoryKeyStore, SecureLink, generate_keypair};
+use ashen_fw::noise_link::{KeyStore, NoiseLink, generate_keypair};
+use ashen_fw::test_util::TestKeyStore;
 use ashen_fw::protocol::{EchoRequest, Envelope, Msg, SessionEnd};
 
 mod common;
@@ -18,9 +19,9 @@ fn echo_request_replies_with_value_plus_one() {
     let server_static = server_keys.private.clone();
     let server_thread = thread::spawn(move || {
         embassy_futures::block_on(async move {
-            let mut keystore = MemoryKeyStore::default();
+            let mut keystore = TestKeyStore::default();
             let mut link =
-                SecureLink::responder_handshake(server_io, &server_static, rng(0x00C0_FFEE), &mut keystore)
+                NoiseLink::responder_handshake(server_io, &server_static, rng(0x00C0_FFEE), &mut keystore)
                     .await
                     .expect("server handshake failed");
 
@@ -33,8 +34,8 @@ fn echo_request_replies_with_value_plus_one() {
     });
 
     embassy_futures::block_on(async move {
-        let mut client_keystore = MemoryKeyStore::default();
-        let mut client = SecureLink::initiator_handshake(
+        let mut client_keystore = TestKeyStore::default();
+        let mut client = NoiseLink::initiator_handshake(
             client_io,
             &client_keys.private,
             rng(0xDEAD_BEEF),
@@ -74,9 +75,9 @@ fn send_log_message_round_trips() {
     let server_static = server_keys.private.clone();
     let server_thread = thread::spawn(move || {
         embassy_futures::block_on(async move {
-            let mut keystore = MemoryKeyStore::default();
+            let mut keystore = TestKeyStore::default();
             let mut link =
-                SecureLink::responder_handshake(server_io, &server_static, rng(0xC0DE_C0DE), &mut keystore)
+                NoiseLink::responder_handshake(server_io, &server_static, rng(0xC0DE_C0DE), &mut keystore)
                     .await
                     .expect("server handshake failed");
 
@@ -93,8 +94,8 @@ fn send_log_message_round_trips() {
     });
 
     embassy_futures::block_on(async move {
-        let mut client_keystore = MemoryKeyStore::default();
-        let mut client = SecureLink::initiator_handshake(
+        let mut client_keystore = TestKeyStore::default();
+        let mut client = NoiseLink::initiator_handshake(
             client_io,
             &client_keys.private,
             rng(0xFEED_FACE),
@@ -133,9 +134,9 @@ fn erase_request_ends_session_and_clears_keystore() {
     let server_static = server_keys.private.clone();
     let server_thread = thread::spawn(move || {
         embassy_futures::block_on(async move {
-            let mut keystore = MemoryKeyStore::default();
+            let mut keystore = TestKeyStore::default();
             let mut link =
-                SecureLink::responder_handshake(server_io, &server_static, rng(0x00C0_FFEE), &mut keystore)
+                NoiseLink::responder_handshake(server_io, &server_static, rng(0x00C0_FFEE), &mut keystore)
                     .await
                     .expect("server handshake failed");
 
@@ -157,8 +158,8 @@ fn erase_request_ends_session_and_clears_keystore() {
     });
 
     embassy_futures::block_on(async move {
-        let mut client_keystore = MemoryKeyStore::default();
-        let mut client = SecureLink::initiator_handshake(
+        let mut client_keystore = TestKeyStore::default();
+        let mut client = NoiseLink::initiator_handshake(
             client_io,
             &client_keys.private,
             rng(0xDEAD_BEEF),
@@ -183,9 +184,9 @@ fn echo_request_overflow_panics() {
     let server_static = server_keys.private.clone();
     let server_thread = thread::spawn(move || {
         embassy_futures::block_on(async move {
-            let mut keystore = MemoryKeyStore::default();
+            let mut keystore = TestKeyStore::default();
             let mut link =
-                SecureLink::responder_handshake(server_io, &server_static, rng(0xAAAA_AAAA), &mut keystore)
+                NoiseLink::responder_handshake(server_io, &server_static, rng(0xAAAA_AAAA), &mut keystore)
                     .await
                     .expect("server handshake failed");
 
@@ -195,8 +196,8 @@ fn echo_request_overflow_panics() {
     });
 
     embassy_futures::block_on(async move {
-        let mut client_keystore = MemoryKeyStore::default();
-        let mut client = SecureLink::initiator_handshake(
+        let mut client_keystore = TestKeyStore::default();
+        let mut client = NoiseLink::initiator_handshake(
             client_io,
             &client_keys.private,
             rng(0xBBBB_BBBB),

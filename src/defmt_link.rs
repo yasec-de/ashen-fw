@@ -5,7 +5,7 @@
 //! - The standard SEGGER RTT "defmt" up-channel, so `probe-rs`/`probe-run`
 //!   keep working exactly as with [`defmt_rtt`](https://docs.rs/defmt-rtt).
 //! - A fixed-size, in-memory [`LOG_QUEUE`], drained by
-//!   [`SecureLink::run_session`](crate::noise_link::SecureLink::run_session)
+//!   [`NoiseLink::run_session`](crate::noise_link::NoiseLink::run_session)
 //!   and forwarded to the host as [`LogMessage`](crate::protocol::LogMessage)
 //!   envelopes whenever the link isn't otherwise busy.
 //!
@@ -182,7 +182,7 @@ static _SEGGER_RTT: RttHeader = RttHeader {
 };
 
 // ---------------------------------------------------------------------
-// Log queue: holds encoded defmt frames for `SecureLink::run_session` to
+// Log queue: holds encoded defmt frames for `NoiseLink::run_session` to
 // forward to the host as `LogMessage` envelopes.
 // ---------------------------------------------------------------------
 
@@ -268,13 +268,13 @@ impl LogQueue {
 static LOG_QUEUE: LogQueue = LogQueue::new();
 
 /// Signaled whenever a new frame is pushed to [`LOG_QUEUE`], so
-/// [`SecureLink::run_session`](crate::noise_link::SecureLink::run_session)
+/// [`NoiseLink::run_session`](crate::noise_link::NoiseLink::run_session)
 /// can wake up and flush the queue even while it is otherwise waiting to
 /// receive a message from the host.
 static LOG_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 /// Pops the oldest queued log frame (if any) into `out`, returning its
-/// length. Used by [`SecureLink::run_session`](crate::noise_link::SecureLink::run_session)
+/// length. Used by [`NoiseLink::run_session`](crate::noise_link::NoiseLink::run_session)
 /// to forward queued log frames to the host.
 pub fn pop_log_frame(out: &mut [u8]) -> Option<usize> {
     LOG_QUEUE.pop(out)

@@ -3,7 +3,7 @@
 //! Panic handlers run in a broken context with no guarantees about the state
 //! of the rest of the program (locks may be held, allocations may fail,
 //! peripherals may be mid-transaction). This module lets the application
-//! [`register`] a [`SecureLink`] once its handshake has completed; on panic,
+//! [`register`] a [`NoiseLink`] once its handshake has completed; on panic,
 //! the handler logs the panic via `defmt` (queueing a frame in
 //! [`crate::defmt_link`]) and makes a best-effort attempt to flush that
 //! queue to the host as [`LogMessage`](crate::protocol::LogMessage)
@@ -20,10 +20,10 @@ use core::cell::RefCell;
 use critical_section::Mutex;
 use embedded_io_async::{Read, Write as IoWrite};
 
-use crate::noise_link::SecureLink;
+use crate::noise_link::NoiseLink;
 
 /// Object-safe interface for flushing queued `defmt` log frames over a
-/// [`SecureLink`] of any transport type.
+/// [`NoiseLink`] of any transport type.
 pub trait PanicReport: Send {
     /// Flushes any `defmt` log frames queued by [`crate::defmt_link`]
     /// (including the panic message just logged by the
@@ -39,9 +39,9 @@ pub trait PanicReport: Send {
     fn flush_log_queue(&mut self);
 }
 
-impl<T: Read + IoWrite + Send> PanicReport for SecureLink<T> {
+impl<T: Read + IoWrite + Send> PanicReport for NoiseLink<T> {
     fn flush_log_queue(&mut self) {
-        let _ = embassy_futures::block_on(SecureLink::flush_log_queue(self));
+        let _ = embassy_futures::block_on(NoiseLink::flush_log_queue(self));
     }
 }
 

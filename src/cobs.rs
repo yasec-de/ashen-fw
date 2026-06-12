@@ -9,7 +9,7 @@
 
 use alloc::vec::Vec;
 use embedded_io_async::{Read, Write};
-use std::fmt;
+use core::fmt;
 
 
 /// Maximum number of plaintext payload bytes in a single COBS frame
@@ -34,7 +34,7 @@ impl fmt::Display for Error {
         match self {
             Error::Truncated => write!(f, "Truncated COBS frame"),
             Error::Io => write!(f, "I/O error"),
-            Error::Framing => write!(f, "Framing error"),
+            Error::Overflow => write!(f, "COBS frame too large"),
         }
     }
 }
@@ -133,13 +133,13 @@ pub async fn read_frame<T: Read>(io: &mut T) -> Result<Vec<u8>, Error> {
         io.read_exact(&mut byte).await.map_err(|_| Error::Io)?;
 
         if byte[0] == 0x00 {
-            return decode(&buf).await
+            return decode(&buf)
         }
 
         if buf.len() < MAX_FRAME_LEN {
             buf.push(byte[0]);
         } else {
-            sync_frame(&mut io).await?;
+            sync_frame(io).await?;
             return Err(Error::Overflow)
         }
     }
@@ -203,7 +203,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn decode_rejects_zero_code_byte() {
-        decode(&[0x00]);
+        let _ = decode(&[0x00]);
     }
 
     #[test]
@@ -218,5 +218,116 @@ mod tests {
         assert_eq!(encode(&[0x00]), vec![0x01, 0x01]);
         assert_eq!(encode(&[0x01, 0x02, 0x03]), vec![0x04, 0x01, 0x02, 0x03]);
         assert_eq!(encode(&[0x01, 0x00, 0x02]), vec![0x02, 0x01, 0x02, 0x02]);
+    }
+
+    /// An in-memory byte source/sink for testing [`read_frame`]/[`write_frame`].
+    struct SliceIo {
+        data: Vec<u8>,
+        pos: usize,
+        out: Vec<u8>,
+    }
+
+    impl SliceIo {
+        fn new(data: Vec<u8>) -> Self {
+            Self {
+                data,
+                pos: 0,
+                out: Vec::new(),
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct SliceError;
+
+    impl embedded_io::Error for SliceError {
+        fn kind(&self) -> embedded_io::ErrorKind {
+            embedded_io::ErrorKind::Other
+        }
+    }
+
+    impl embedded_io::ErrorType for SliceIo {
+        type Error = SliceError;
+    }
+
+    impl Read for SliceIo {
+        async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+            if self.pos >= self.data.len() {
+                return Err(SliceError);
+            }
+            buf[0] = self.data[self.pos];
+            self.pos += 1;
+            Ok(1)
+        }
+    }
+
+    impl Write for SliceIo {
+        async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+            self.out.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        async fn flush(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn frame_round_trip() {
+        embassy_futures::block_on(async {
+            let mut io = SliceIo::new(Vec::new());
+            write_frame(&mut io, b"hello world").await.unwrap();
+
+            let mut reader = SliceIo::new(io.out);
+            let frame = read_frame(&mut reader).await.unwrap();
+            assert_eq!(frame, b"hello world");
+        });
+    }
+
+    #[test]
+    fn resync_after_corrupt_frame() {
+        embassy_futures::block_on(async {
+            // A corrupt frame (a code byte claiming more data than follows,
+            // which is invalid COBS) followed by the delimiter, then a valid
+            // frame.
+            let mut data = vec![0x05, 0x00];
+            let mut good = encode(b"second frame");
+            good.push(0x00);
+            data.append(&mut good);
+
+            let mut io = SliceIo::new(data);
+
+            // First frame is corrupt.
+            assert!(matches!(read_frame(&mut io).await, Err(Error::Truncated)));
+
+            // Reader has resynchronized and can decode the next frame.
+            let frame = read_frame(&mut io).await.unwrap();
+            assert_eq!(frame, b"second frame");
+        });
+    }
+
+    #[test]
+    fn resync_after_oversized_frame() {
+        embassy_futures::block_on(async {
+            // A frame longer than MAX_FRAME_LEN (no zero bytes, so it's
+            // valid COBS, just too long), followed by the delimiter, then a
+            // valid frame.
+            let oversized: Vec<u8> = (0..MAX_FRAME_LEN + 10)
+                .map(|i| (i % 255 + 1) as u8)
+                .collect();
+            let mut data = encode(&oversized);
+            data.push(0x00);
+
+            let mut good = encode(b"after overflow");
+            good.push(0x00);
+            data.append(&mut good);
+
+            let mut io = SliceIo::new(data);
+
+            assert!(matches!(read_frame(&mut io).await, Err(Error::Overflow)));
+
+            let frame = read_frame(&mut io).await.unwrap();
+            assert_eq!(frame, b"after overflow");
+        });
     }
 }
