@@ -33,10 +33,8 @@ pub const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
 pub enum Error {
     Transport(cobs::Error),
     Crypto(snow::Error),
-    UntrustedPeer,
-    /// A received payload could not be decoded as a protobuf [`Envelope`](crate::protocol::Envelope),
-    /// or an [`Envelope`](crate::protocol::Envelope) could not be encoded.
     Protocol,
+    AlreadyKeyed,
 }
 
 impl fmt::Display for Error {
@@ -44,8 +42,8 @@ impl fmt::Display for Error {
         match self {
             Error::Transport(e) => write!(f, "Transport error: {}", e),
             Error::Crypto(e) => write!(f, "Noise protocol error: {}", e),
-            Error::UntrustedPeer => write!(f, "Untrusted peer"),
             Error::Protocol => write!(f, "Protobuf encode/decode error"),
+            Error::AlreadyKeyed => write!(f, "Link already has a trusted peer"),
         }
     }
 }
@@ -116,8 +114,6 @@ pub(crate) fn builder(rng: Box<dyn Random>) -> Result<Builder<'static>, Error> {
     ))
 }
 
-/// Generates a new static Curve25519 keypair for use with
-/// [`NoiseLink::responder_handshake`].
 pub fn generate_keypair(rng: Box<dyn Random>) -> Result<snow::Keypair, Error> {
     Ok(builder(rng)?.generate_keypair()?)
 }
@@ -126,55 +122,6 @@ pub struct NoiseLink<T> {
     pub(crate) io: T,
     pub(crate) transport: TransportState,
     pub(crate) peer_trusted: bool,
-    pub remote_static: [u8; 32],
-}
-
-/// Performs the responder side of a Noise_XX handshake (`<- e, ee, s, es`
-/// then `-> s, se`) over `io`, checking the initiator's static key against
-/// `keystore`.
-///
-/// Returns the resulting [`TransportState`], the initiator's static key,
-/// and whether it was already trusted (`true`) or hasn't been trusted yet
-/// (`false`). A previously-trusted key that doesn't match is reported as
-/// [`Error::UntrustedPeer`].
-async fn do_responder_handshake<T: Read + Write, K: KeyStore>(
-    io: &mut T,
-    local_static_key: &[u8],
-    rng: Box<dyn Random>,
-    keystore: &mut K,
-) -> Result<(TransportState, [u8; 32], bool), Error> {
-    let mut hs = builder(rng)?
-        .local_private_key(local_static_key)?
-        .build_responder()?;
-
-    let mut buf = vec![0u8; cobs::MAX_PAYLOAD_LEN + 16];
-
-    // -> e
-    let msg = cobs::read_frame(io).await?;
-    hs.read_message(&msg, &mut buf)?;
-
-    // <- e, ee, s, es
-    let len = hs.write_message(&[], &mut buf)?;
-    cobs::write_frame(io, &buf[..len]).await?;
-
-    // -> s, se
-    let msg = cobs::read_frame(io).await?;
-    hs.read_message(&msg, &mut buf)?;
-
-    let remote_static = hs
-        .get_remote_static()
-        .expect("XX responder always learns remote static");
-    let mut key = [0u8; 32];
-    key.copy_from_slice(remote_static);
-
-    let peer_trusted = match keystore.trusted_key() {
-        Some(trusted) if bool::from(trusted.ct_eq(&key)) => true,
-        Some(_) => return Err(Error::UntrustedPeer),
-        None => false,
-    };
-
-    let transport = hs.into_transport_mode()?;
-    Ok((transport, key, peer_trusted))
 }
 
 impl<T: Read + Write> NoiseLink<T> {
@@ -187,14 +134,40 @@ impl<T: Read + Write> NoiseLink<T> {
         rng: Box<dyn Random>,
         keystore: &mut K,
     ) -> Result<Self, Error> {
-        let (transport, remote_static, peer_trusted) =
-            do_responder_handshake(&mut io, local_static_key, rng, keystore).await?;
+        let mut hs = builder(rng)?
+            .local_private_key(local_static_key)?
+            .build_responder()?;
 
+        let mut buf = vec![0u8; cobs::MAX_PAYLOAD_LEN];
+
+        // -> e
+        let msg = cobs::read_frame(io).await?;
+        hs.read_message(&msg, &mut buf)?;
+
+        // <- e, ee, s, es
+        let len = hs.write_message(&[], &mut buf)?;
+        cobs::write_frame(io, &buf[..len]).await?;
+
+        // -> s, se
+        let msg = cobs::read_frame(io).await?;
+        hs.read_message(&msg, &mut buf)?;
+
+        let remote_static = hs
+            .get_remote_static()
+            .expect("XX responder always learns remote static");
+        let mut key = [0u8; 32];
+        key.copy_from_slice(remote_static);
+
+        let peer_trusted = match keystore.trusted_key() {
+            Some(trusted) => bool::from(trusted.ct_eq(&remote_static)),
+            None => false,
+        };
+
+        let transport = hs.into_transport_mode()?;
         let mut link = Self {
             io,
             transport,
             peer_trusted,
-            remote_static,
         };
         if !peer_trusted {
             // First connection: trust-on-first-use.
@@ -203,50 +176,39 @@ impl<T: Read + Write> NoiseLink<T> {
         Ok(link)
     }
 
-    /// Re-runs the responder handshake on this link's existing transport,
-    /// replacing its transport state, [`NoiseLink::remote_static`], and
-    /// trust status in place.
-    pub async fn restart_responder<K: KeyStore>(
-        &mut self,
-        local_static_key: &[u8],
-        rng: Box<dyn Random>,
-        keystore: &mut K,
-    ) -> Result<(), Error> {
-        let (transport, remote_static, peer_trusted) =
-            do_responder_handshake(&mut self.io, local_static_key, rng, keystore).await?;
-
-        self.transport = transport;
-        self.peer_trusted = peer_trusted;
-        self.remote_static = remote_static;
-        if !peer_trusted {
-            // First connection: trust-on-first-use.
-            self.trust(keystore);
-        }
-        Ok(())
-    }
-
     /// Records this link's [`NoiseLink::remote_static`] as the trusted peer
     /// key in `keystore`, and marks this link as trusted.
-    pub fn trust<K: KeyStore>(&mut self, keystore: &mut K) {
-        keystore.trust(self.remote_static);
+    pub fn trust<K: KeyStore>(&mut self, keystore: &mut K) -> Result<(), Error> {
+        if keystore.trusted_key().is_some() {
+            return Err(Error::AlreadyKeyed);
+        }
+
+        let remote_static = self.transport
+            .get_remote_static()
+            .expect("XX responder always learns remote static");
+        let mut key = [0u8; 32];
+        key.copy_from_slice(remote_static);
+        
+        keystore.trust(remote_static);
         self.peer_trusted = true;
+        Ok(())
     }
 
     /// Encrypts and sends `payload` as a single transport message.
     pub async fn send(&mut self, payload: &[u8]) -> Result<(), Error> {
-        let mut cipher = vec![0u8; payload.len() + 16];
-        let len = self.transport.write_message(payload, &mut cipher)?;
-        cobs::write_frame(&mut self.io, &cipher[..len]).await?;
+        let mut ciphertext = vec![0u8; payload.len()];
+        let len = self.transport.write_message(payload, &mut ciphertext)?;
+        cobs::write_frame(&mut self.io, &ciphertext[..len]).await?;
         Ok(())
     }
 
     /// Receives and decrypts a single transport message.
     pub async fn receive(&mut self) -> Result<Vec<u8>, Error> {
         let msg = cobs::read_frame(&mut self.io).await?;
-        let mut plain = vec![0u8; msg.len()];
-        let len = self.transport.read_message(&msg, &mut plain)?;
-        plain.truncate(len);
-        Ok(plain)
+        let mut plaintext = vec![0u8; msg.len()];
+        let len = self.transport.read_message(&msg, &mut plaintext)?;
+        plaintext.truncate(len);
+        Ok(plaintext)
     }
 
     /// Sends `request` and returns the corresponding response.

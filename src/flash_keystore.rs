@@ -1,6 +1,3 @@
-//! Persists the trust-on-first-use (TOFU) remote static key to internal
-//! flash, so it survives power cycles.
-
 use core::mem::MaybeUninit;
 
 use embassy_stm32::flash::{Blocking, FLASH_BASE, Flash, MAX_ERASE_SIZE, WRITE_SIZE};
@@ -17,15 +14,7 @@ const _: () = assert!(
     "KeystoreRecord assumes 8-byte flash write granularity"
 );
 
-/// On-flash layout of the persisted TOFU record. `align(8)` matches
-/// embassy-stm32's flash double-word write granularity (`WRITE_SIZE`), so
-/// each field is independently writable.
-///
-/// To avoid leaving a stale [`MAGIC`] marker pointing at a partially-written
-/// key if power is lost mid-write, the key is written *before* the magic
-/// marker. If a write is interrupted before the magic field is written, the
-/// page still reads back as "no key stored" rather than as a trusted key
-/// with corrupted (and possibly attacker-influenced) bytes.
+/// On-flash layout of the persisted peer key. STM32G474 requires 8 byte alignment.
 #[repr(C, align(8))]
 struct KeystoreRecord {
     /// Validity marker (see [`MAGIC`]), padded to the flash write
@@ -50,23 +39,14 @@ const _: () = assert!(
 #[used]
 static KEYSTORE_RECORD: MaybeUninit<KeystoreRecord> = MaybeUninit::uninit();
 
-/// A [`KeyStore`] that persists the trusted remote static key to a region of
-/// internal flash.
-///
-/// The trusted key (if any) is read once at construction time and cached,
-/// since [`KeyStore::trusted_key`] takes `&self` but flash writes require
-/// `&mut self`.
+
 pub struct FlashKeyStore<'d> {
     flash: Flash<'d, Blocking>,
     cached: Option<[u8; 32]>,
 }
 
 impl<'d> FlashKeyStore<'d> {
-    /// Opens the key store backed by `flash`, reading any previously stored
-    /// key from the reserved `.keystore` flash page.
     pub fn new(flash: Flash<'d, Blocking>) -> Self {
-        // SAFETY: KEYSTORE_RECORD is memory-mapped flash; reading it is
-        // always valid (erased flash reads back as 0xFF).
         let record = unsafe { &*KEYSTORE_RECORD.as_ptr() };
         let cached = (record.magic[0] == MAGIC).then_some(record.key);
 
@@ -81,29 +61,19 @@ impl KeyStore for FlashKeyStore<'_> {
 
     fn trust(&mut self, key: [u8; 32]) {
         let ptr = KEYSTORE_RECORD.as_ptr();
-        let page_start = ptr as u32 - FLASH_BASE as u32;
-        let magic_addr = unsafe { &raw const (*ptr).magic } as u32 - FLASH_BASE as u32;
-        let key_addr = unsafe { &raw const (*ptr).key } as u32 - FLASH_BASE as u32;
-
-        let mut key_record = [0xFFu8; 32];
-        key_record.copy_from_slice(&key);
+        self.erase();
 
         let mut magic_record = [0xFFu8; WRITE_SIZE];
         magic_record[0] = MAGIC;
-
-        self.flash
-            .blocking_erase(page_start, page_start + MAX_ERASE_SIZE as u32)
-            .expect("flash erase failed while persisting TOFU key");
-        // Write the key first; only write the magic marker once the key is
-        // safely on flash, so a power loss in between leaves the page
-        // reading back as "no key stored" rather than as a trusted key
-        // backed by a corrupted/partial record.
-        self.flash
-            .blocking_write(key_addr, &key_record)
-            .expect("flash write failed while persisting TOFU key");
+        let magic_addr = unsafe { &raw const (*ptr).magic } as u32 - FLASH_BASE as u32;
         self.flash
             .blocking_write(magic_addr, &magic_record)
-            .expect("flash write failed while persisting TOFU key");
+            .expect("flash write failed while persisting peer key");
+
+        let key_addr = unsafe { &raw const (*ptr).key } as u32 - FLASH_BASE as u32;
+        self.flash
+            .blocking_write(key_addr, &key)
+            .expect("flash write failed while persisting peer key");
 
         self.cached = Some(key);
     }
@@ -113,8 +83,8 @@ impl KeyStore for FlashKeyStore<'_> {
         let page_start = ptr as u32 - FLASH_BASE as u32;
 
         self.flash
-            .blocking_erase(page_start, page_start + MAX_ERASE_SIZE as u32)
-            .expect("flash erase failed while erasing TOFU key");
+            .blocking_erase( , page_start + MAX_ERASE_SIZE as u32)
+            .expect("Peer key store flash erase failed");
 
         self.cached = None;
     }
