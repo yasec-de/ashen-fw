@@ -1,6 +1,6 @@
 use core::mem::MaybeUninit;
 
-use embassy_stm32::flash::{Blocking, FLASH_BASE, FLASH_SIZE, Flash, MAX_ERASE_SIZE, WRITE_SIZE};
+use embassy_stm32::flash::{Blocking, FLASH_BASE, Flash, MAX_ERASE_SIZE, WRITE_SIZE};
 
 use crate::noise_link::KeyStore;
 
@@ -28,13 +28,17 @@ const _: () = assert!(
     "KeystoreRecord does not fit within a single erase page"
 );
 
+// Check embassy flash config: The stm32g474 has 4K erase pages only in
+// single-bank mode; the dual-bank config has 2K pages. This code and the linker
+// script curerntly assume single-bank config.
+const _: () = assert!(
+    MAX_ERASE_SIZE == 4096,
+    "firmware requires embassy single-bank flash config on STM32G474"
+);
+
 /// The reserved flash page for [`FlashKeyStore`] (see `keystore.x`), placed
 /// in the `.keystore` linker section, which `keystore.x` positions at the
-/// last erase page of flash. `MaybeUninit` + the section being `NOLOAD`
-/// means this occupies no space in the firmware image.
-///
-/// Since flash is memory-mapped on STM32, this static doubles as a live,
-/// directly-readable alias of the on-flash record.
+/// last erase page of flash.
 #[unsafe(link_section = ".keystore")]
 #[used]
 static KEYSTORE_RECORD: MaybeUninit<KeystoreRecord> = MaybeUninit::uninit();
@@ -47,25 +51,6 @@ pub struct FlashKeyStore<'d> {
 
 impl<'d> FlashKeyStore<'d> {
     pub fn new(flash: Flash<'d, Blocking>) -> Self {
-        // The linker (`keystore.x`) reserves the page at a fixed address using a
-        // hardcoded size, which has no way to reference the HAL's runtime flash
-        // geometry. Verify here that the reserved region really is exactly the
-        // last hardware erase page: `page_start` must be erase-aligned (so the
-        // erase doesn't reach into the page below, which may hold firmware) and
-        // the page must extend exactly to the end of flash (so the erase doesn't
-        // run past it). This catches a chip/bank change (e.g. dropping the
-        // `single-bank` feature, which flips the G474 to 2K pages) at boot
-        // instead of silently corrupting flash on the first `trust()`/`erase()`.
-        let page_start = KEYSTORE_RECORD.as_ptr() as usize - FLASH_BASE;
-        assert!(
-            page_start % MAX_ERASE_SIZE == 0,
-            "keystore page is not erase-aligned; check the reserved size in keystore.x"
-        );
-        assert!(
-            page_start + MAX_ERASE_SIZE == FLASH_SIZE,
-            "keystore must reserve exactly the last erase page; check keystore.x"
-        );
-
         let record = unsafe { &*KEYSTORE_RECORD.as_ptr() };
         let cached = (record.magic[0] == MAGIC).then_some(record.key);
 

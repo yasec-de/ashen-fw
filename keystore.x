@@ -28,3 +28,13 @@ SECTIONS
 ASSERT(__veneer_limit <= _keystore_start, "
 ERROR: the firmware image (.text/.rodata/.data) has grown into the reserved
 .keystore page at the end of flash.");
+
+/* The reserved region must start on a 4K erase-page boundary, otherwise
+ * FlashKeyStore::erase() (which erases one MAX_ERASE_SIZE-aligned page) would
+ * either be rejected as unaligned or reach into the firmware page below it.
+ * This holds as long as FLASH's length is a multiple of 4K; assert it so a
+ * future memory.x change can't silently break the placement. The size match
+ * between this 4K and the chip's actual erase page (MAX_ERASE_SIZE) is checked
+ * at compile time in src/flash_keystore.rs. */
+ASSERT((_keystore_start & (4K - 1)) == 0, "
+ERROR: .keystore is not aligned to a 4K flash erase page.");
