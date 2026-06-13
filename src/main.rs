@@ -6,7 +6,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 
 use ashen_fw::flash_keystore::FlashKeyStore;
-use ashen_fw::hw_rng::HwRng;
+use ashen_fw::hw_rng::{self, HwRng};
 use ashen_fw::noise_link::{KeyStore, Random, NoiseLink, generate_keypair};
 use ashen_fw::protocol::SessionEnd;
 use embassy_executor::Spawner;
@@ -50,19 +50,12 @@ async fn blink(mut led: Output<'static>) {
     }
 }
 
-/// Returns a fresh, boxed [`HwRng`] backed by the RNG peripheral.
+/// Returns a fresh, boxed [`HwRng`] handle for the RNG peripheral.
 ///
-/// `rng` is never moved out of `p`; each call clones a fresh handle to the
-/// peripheral instead.
-///
-/// # Safety
-///
-/// The returned `HwRng` must not be used concurrently with any other handle
-/// to the RNG peripheral obtained this way. This holds as long as each
-/// returned `Box` is fully consumed (by [`generate_keypair`] or a
-/// handshake/restart call) before the next one is created.
-unsafe fn boxed_hw_rng(rng: &embassy_stm32::Peri<'static, RNG>) -> Box<dyn Random> {
-    Box::new(HwRng::new(Rng::new(unsafe { rng.clone_unchecked() }, Irqs)))
+/// [`hw_rng::init`] must have installed the driver first. Handles are
+/// zero-sized and may be created freely; see [`ashen_fw::hw_rng`].
+fn boxed_hw_rng() -> Box<dyn Random> {
+    Box::new(HwRng::new())
 }
 
 #[embassy_executor::main]
@@ -73,13 +66,15 @@ async fn main(spawner: Spawner) {
         .spawn(blink(Output::new(p.PA5, Level::Low, Speed::Low)))
         .expect("failed to spawn blink task");
 
+    // Hand the RNG peripheral to `hw_rng`, which owns it for the rest of the
+    // program and hands out `HwRng` handles on demand.
+    hw_rng::init(Rng::new(p.RNG, Irqs));
+
     let flash = Flash::new_blocking(p.FLASH);
     let mut keystore = FlashKeyStore::new(flash);
 
     // This boot's ephemeral local keypair.
-    // SAFETY: this `HwRng` is fully consumed by `generate_keypair` before
-    // any other handle to the RNG peripheral is created.
-    let mut local_keys = generate_keypair(unsafe { boxed_hw_rng(&p.RNG) }).expect("local keypair generation failed");
+    let mut local_keys = generate_keypair(boxed_hw_rng()).expect("local keypair generation failed");
 
     let mut usart_config = UsartConfig::default();
     usart_config.baudrate = 1_000_000;
@@ -97,9 +92,7 @@ async fn main(spawner: Spawner) {
     )
     .expect("USART1 init failed");
 
-    // SAFETY: see `boxed_hw_rng`; this handle is fully consumed by the
-    // handshake before the next one is created in the loop below.
-    let handshake_rng = unsafe { boxed_hw_rng(&p.RNG) };
+    let handshake_rng = boxed_hw_rng();
     let link = NoiseLink::responder_handshake(uart, &local_keys.private, handshake_rng, &mut keystore)
         .await
         .expect("handshake failed");
@@ -129,8 +122,7 @@ async fn main(spawner: Spawner) {
 
         if let SessionEnd::Erased = end {
             keystore.erase();
-            // SAFETY: see `boxed_hw_rng`.
-            local_keys = generate_keypair(unsafe { boxed_hw_rng(&p.RNG) })
+            local_keys = generate_keypair(boxed_hw_rng())
                 .expect("local keypair generation failed");
         }
 
@@ -138,8 +130,7 @@ async fn main(spawner: Spawner) {
         // peer is expected to reconnect. The slot is briefly empty while the
         // handshake runs (see `panic_link`'s `Option` impl).
         let io = link.take().expect("link present").into_io();
-        // SAFETY: see `boxed_hw_rng`.
-        let rng = unsafe { boxed_hw_rng(&p.RNG) };
+        let rng = boxed_hw_rng();
         *link = Some(
             NoiseLink::responder_handshake(io, &local_keys.private, rng, &mut keystore)
                 .await

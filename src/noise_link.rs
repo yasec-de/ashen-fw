@@ -191,8 +191,8 @@ impl<T: Read + Write> NoiseLink<T> {
         self.io
     }
 
-    /// Records this link's [`NoiseLink::remote_static`] as the trusted peer
-    /// key in `keystore`, and marks this link as trusted.
+    /// Records the currently connected peer as the trusted peer
+    /// in `keystore`, and marks this link as trusted.
     pub fn trust<K: KeyStore>(&mut self, keystore: &mut K) -> Result<(), Error> {
         if keystore.trusted_key().is_some() {
             return Err(Error::AlreadyKeyed);
