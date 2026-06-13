@@ -6,12 +6,13 @@ message Envelope {
   oneof msg {
     LogMessage log = 1;
     Erase erase = 2;
-    Pair pair = 3;
-    IsKeyed is_keyed = 4;
-    IsKeyedResponse is_keyed_response = 5;
-    Disconnect disconnect = 6;
-    EchoRequest echo_request = 7;
-    EchoResponse echo_response = 8;
+    PairRequest pair_request = 3;
+    PairResponse pair_response = 4;
+    StatusRequest status_request= 5;
+    StatusResponse status_response = 6;
+    Disconnect disconnect = 7;
+    EchoRequest echo_request = 8;
+    EchoResponse echo_response = 9;
   }
 }
 
@@ -30,21 +31,25 @@ message Erase {
 
 // Sent from the host to the device. Tells the device to commit this host's
 // long-term identity key to its key store. Can only be run on an Erase'd device.
-message Pair {
+message PairRequest {
 }
 
-// Sent from host to the device. A command requesting if the device is keyed,
-// i.e. is paired to a trusted peer already.
-message IsKeyed {
+message PairResponse {
+  bool success = 1;
 }
 
-// The device's reply to IsKeyed
-message IsKeyedResponse {
-  bool is_keyed = 1;
+// Sent from host to the device. A command requesting the status of the device
+// and of this connection.
+message StatusRequest {
 }
 
-// Sent by either side to end the session. The receiver stops processing
-// messages on this link and restarts the link with a fresh
+message StatusResponse {
+  bool peer_trusted = 1; // Is the currently connected peer (who sent the request) trusted?
+  bool is_keyed = 2; // Is the device programmed with *some* key, or is it erased?
+}
+
+// Sent by the host to end the session. The receiver responds with its own Disconnect,
+// then stops processing messages on this link and restarts the link with a fresh
 // handshake.
 message Disconnect {
 }

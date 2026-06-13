@@ -25,7 +25,7 @@ fn echo_request_replies_with_value_plus_one() {
                     .await
                     .expect("server handshake failed");
 
-            match link.run_session().await {
+            match link.run_session(&mut keystore).await {
                 SessionEnd::Disconnected => {}
                 SessionEnd::Erased => panic!("unexpected SessionEnd::Erased"),
                 SessionEnd::Error(e) => panic!("unexpected session error: {e:?}"),
@@ -83,7 +83,7 @@ fn send_log_message_round_trips() {
                 .await
                 .expect("send log message failed");
 
-            match link.run_session().await {
+            match link.run_session(&mut keystore).await {
                 SessionEnd::Disconnected => {}
                 SessionEnd::Erased => panic!("unexpected SessionEnd::Erased"),
                 SessionEnd::Error(e) => panic!("unexpected session error: {e:?}"),
@@ -130,17 +130,21 @@ fn erase_request_ends_session_and_clears_keystore() {
     let server_static = server_keys.private.clone();
     let server_thread = thread::spawn(move || {
         embassy_futures::block_on(async move {
+            // Simulate a device that was previously paired with this client:
+            // its static key is already committed to the keystore.
             let mut keystore = TestKeyStore::default();
+            keystore.trust(client_public);
+
             let mut link =
                 NoiseLink::responder_handshake(server_io, &server_static, rng(0x00C0_FFEE), &mut keystore)
                     .await
                     .expect("server handshake failed");
 
-            // TOFU: the server learned the client's static key on this
-            // first handshake.
+            // The presented key matches the trusted one, so the peer is trusted.
             assert_eq!(keystore.trusted_key(), Some(client_public));
+            assert!(link.is_peer_trusted());
 
-            match link.run_session().await {
+            match link.run_session(&mut keystore).await {
                 SessionEnd::Erased => {}
                 other => panic!("expected SessionEnd::Erased, got {other:?}"),
             }
@@ -185,7 +189,7 @@ fn echo_request_overflow_panics() {
                     .expect("server handshake failed");
 
             // Should panic on overflow rather than wrap or return an error.
-            link.run_session().await;
+            link.run_session(&mut keystore).await;
         });
     });
 

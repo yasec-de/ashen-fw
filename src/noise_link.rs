@@ -162,25 +162,33 @@ impl<T: Read + Write> NoiseLink<T> {
             None => false,
         };
 
-        let mut link = Self {
+        let link = Self {
             io,
             transport,
             peer_trusted,
         };
+
         Ok(link)
     }
 
-    pub fn peer_key(&mut self) -> &[u8; 32] {
+    pub fn peer_key(&mut self) -> [u8; 32] {
         let remote_static = self.transport
             .get_remote_static()
             .expect("XX responder always learns remote static");
         let mut key = [0u8; 32];
         key.copy_from_slice(remote_static);
-        &key
+        key
     }
 
     pub fn is_peer_trusted(&self) -> bool {
         self.peer_trusted
+    }
+
+    /// Consumes the link, returning its underlying transport so a fresh
+    /// handshake can be performed over the same I/O channel (see
+    /// [`NoiseLink::responder_handshake`]).
+    pub fn into_io(self) -> T {
+        self.io
     }
 
     /// Records this link's [`NoiseLink::remote_static`] as the trusted peer
@@ -203,7 +211,10 @@ impl<T: Read + Write> NoiseLink<T> {
 
     /// Encrypts and sends `payload` as a single transport message.
     pub async fn send(&mut self, payload: &[u8]) -> Result<(), Error> {
-        let mut ciphertext = vec![0u8; payload.len()];
+        // Room for the plaintext plus the 16-byte AEAD authentication tag
+        // that `write_message` appends.
+        const TAG_LEN: usize = 16;
+        let mut ciphertext = vec![0u8; payload.len() + TAG_LEN];
         let len = self.transport.write_message(payload, &mut ciphertext)?;
         cobs::write_frame(&mut self.io, &ciphertext[..len]).await?;
         Ok(())

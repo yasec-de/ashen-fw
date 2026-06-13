@@ -8,13 +8,9 @@ use embedded_io_async::{Read, Write};
 
 use crate::cobs;
 use crate::noise_link::{Error, KeyStore, NoiseLink, Random, builder};
+use crate::protocol::{Disconnect, Envelope, Erase, Msg, PairRequest};
 
-/// A minimal xorshift64* PRNG.
-///
-/// **Not cryptographically secure.** This exists purely as a deterministic,
-/// fast [`Random`] source for tests, so that test runs are fully
-/// reproducible. Production code must use a true hardware entropy source
-/// (see [`crate::hw_rng`]).
+/// PRNG for providing deterministic randomness during tests
 #[derive(Clone)]
 pub struct XorShiftRng(u64);
 
@@ -72,7 +68,7 @@ impl KeyStore for TestKeyStore {
 
 /// Initiator-side handshake code mirroring [`NoiseLink::responder_handshake`] for integration tests.
 impl<T: Read + Write> NoiseLink<T> {
-    pub async fn initiator_handshake<K: KeyStore>(
+    pub async fn initiator_handshake(
         mut io: T,
         local_static_key: &[u8],
         rng: Box<dyn Random>,
@@ -102,5 +98,31 @@ impl<T: Read + Write> NoiseLink<T> {
             peer_trusted: true,
         };
         Ok(link)
+    }
+
+    /// Sends a [`Disconnect`], telling the peer to end the session.
+    pub async fn send_disconnect(&mut self) -> Result<(), Error> {
+        self.send_envelope(&Envelope {
+            r#msg: Some(Msg::Disconnect(Disconnect::default())),
+        })
+        .await
+    }
+
+    /// Sends an [`Erase`], telling the peer to end the session, erase its
+    /// TOFU keystore, and regenerate its static identity key.
+    pub async fn send_erase(&mut self) -> Result<(), Error> {
+        self.send_envelope(&Envelope {
+            r#msg: Some(Msg::Erase(Erase::default())),
+        })
+        .await
+    }
+
+    /// Sends a [`PairRequest`], asking the peer to commit our static key to
+    /// its keystore (only succeeds while the peer is erased/unkeyed).
+    pub async fn send_pair_request(&mut self) -> Result<(), Error> {
+        self.send_envelope(&Envelope {
+            r#msg: Some(Msg::PairRequest(PairRequest::default())),
+        })
+        .await
     }
 }

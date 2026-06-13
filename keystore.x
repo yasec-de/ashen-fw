@@ -27,5 +27,4 @@ SECTIONS
 
 ASSERT(__veneer_limit <= _keystore_start, "
 ERROR: the firmware image (.text/.rodata/.data) has grown into the reserved
-.keystore page at the end of flash. Either shrink the firmware or adjust the
-reservation in keystore.x.");
+.keystore page at the end of flash.");

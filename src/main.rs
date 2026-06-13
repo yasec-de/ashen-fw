@@ -104,8 +104,11 @@ async fn main(spawner: Spawner) {
         .await
         .expect("handshake failed");
 
-    static LINK: StaticCell<NoiseLink<BufferedUart<'static>>> = StaticCell::new();
-    let link = LINK.init(link);
+    // The link lives in an `Option` slot so that, between sessions, it can
+    // be taken out (recovering the underlying UART) and replaced with a
+    // freshly handshaked link over the same UART.
+    static LINK: StaticCell<Option<NoiseLink<BufferedUart<'static>>>> = StaticCell::new();
+    let link = LINK.init(Some(link));
 
     // SAFETY: this creates a second `&'static mut` alias of `link`, used
     // only by the panic handler. The panic handler runs (at most once) only
@@ -113,27 +116,34 @@ async fn main(spawner: Spawner) {
     // `ashen_fw::panic_link`), at which point the session loop below can no
     // longer be touching `link`, so the two references are never live at
     // the same time.
-    let panic_link: &'static mut NoiseLink<BufferedUart<'static>> = unsafe { &mut *(link as *mut _) };
+    let panic_link: &'static mut Option<NoiseLink<BufferedUart<'static>>> =
+        unsafe { &mut *(link as *mut _) };
     ashen_fw::panic_link::register(panic_link);
 
     loop {
-        match link.run_session().await {
-            // Either way, restart the link with a fresh handshake: the
-            // peer is expected to reconnect.
-            SessionEnd::Disconnected | SessionEnd::Error(_) => {
-                // SAFETY: see `boxed_hw_rng`.
-                let rng = unsafe { boxed_hw_rng(&p.RNG) };
-                let _ = link.restart_responder(&local_keys.private, rng, &mut keystore).await;
-            }
-            SessionEnd::Erased => {
-                keystore.erase();
-                // SAFETY: see `boxed_hw_rng`.
-                local_keys = generate_keypair(unsafe { boxed_hw_rng(&p.RNG) })
-                    .expect("local keypair generation failed");
-                // SAFETY: see `boxed_hw_rng`.
-                let rng = unsafe { boxed_hw_rng(&p.RNG) };
-                let _ = link.restart_responder(&local_keys.private, rng, &mut keystore).await;
-            }
+        let end = link
+            .as_mut()
+            .expect("link is always present at the start of a session")
+            .run_session(&mut keystore)
+            .await;
+
+        if let SessionEnd::Erased = end {
+            keystore.erase();
+            // SAFETY: see `boxed_hw_rng`.
+            local_keys = generate_keypair(unsafe { boxed_hw_rng(&p.RNG) })
+                .expect("local keypair generation failed");
         }
+
+        // Restart the link with a fresh handshake over the same UART: the
+        // peer is expected to reconnect. The slot is briefly empty while the
+        // handshake runs (see `panic_link`'s `Option` impl).
+        let io = link.take().expect("link present").into_io();
+        // SAFETY: see `boxed_hw_rng`.
+        let rng = unsafe { boxed_hw_rng(&p.RNG) };
+        *link = Some(
+            NoiseLink::responder_handshake(io, &local_keys.private, rng, &mut keystore)
+                .await
+                .expect("handshake failed"),
+        );
     }
 }
