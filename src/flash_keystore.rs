@@ -1,6 +1,6 @@
 use core::mem::MaybeUninit;
 
-use embassy_stm32::flash::{Blocking, FLASH_BASE, Flash, MAX_ERASE_SIZE, WRITE_SIZE};
+use embassy_stm32::flash::{Blocking, FLASH_BASE, FLASH_SIZE, Flash, MAX_ERASE_SIZE, WRITE_SIZE};
 
 use crate::noise_link::KeyStore;
 
@@ -47,6 +47,25 @@ pub struct FlashKeyStore<'d> {
 
 impl<'d> FlashKeyStore<'d> {
     pub fn new(flash: Flash<'d, Blocking>) -> Self {
+        // The linker (`keystore.x`) reserves the page at a fixed address using a
+        // hardcoded size, which has no way to reference the HAL's runtime flash
+        // geometry. Verify here that the reserved region really is exactly the
+        // last hardware erase page: `page_start` must be erase-aligned (so the
+        // erase doesn't reach into the page below, which may hold firmware) and
+        // the page must extend exactly to the end of flash (so the erase doesn't
+        // run past it). This catches a chip/bank change (e.g. dropping the
+        // `single-bank` feature, which flips the G474 to 2K pages) at boot
+        // instead of silently corrupting flash on the first `trust()`/`erase()`.
+        let page_start = KEYSTORE_RECORD.as_ptr() as usize - FLASH_BASE;
+        assert!(
+            page_start % MAX_ERASE_SIZE == 0,
+            "keystore page is not erase-aligned; check the reserved size in keystore.x"
+        );
+        assert!(
+            page_start + MAX_ERASE_SIZE == FLASH_SIZE,
+            "keystore must reserve exactly the last erase page; check keystore.x"
+        );
+
         let record = unsafe { &*KEYSTORE_RECORD.as_ptr() };
         let cached = (record.magic[0] == MAGIC).then_some(record.key);
 

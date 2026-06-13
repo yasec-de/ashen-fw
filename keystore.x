@@ -1,4 +1,4 @@
-/* Reserves the last erase page (2K) of internal flash for FlashKeyStore
+/* Reserves the last erase page (4K) of internal flash for FlashKeyStore
  * (see src/flash_keystore.rs).
  *
  * The section is NOLOAD: it occupies no space in the firmware image, so a
@@ -18,7 +18,7 @@
  */
 SECTIONS
 {
-  .keystore ORIGIN(FLASH) + LENGTH(FLASH) - 2K (NOLOAD) : ALIGN(4)
+  .keystore ORIGIN(FLASH) + LENGTH(FLASH) - 4K (NOLOAD) : ALIGN(4)
   {
     _keystore_start = .;
     KEEP(*(.keystore));
