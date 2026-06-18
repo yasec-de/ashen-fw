@@ -4,6 +4,12 @@
     nixpkgs-lib.url = "github:nix-community/nixpkgs.lib";
     rust-overlay.url = "github:oxalica/rust-overlay";
     rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
+    # A separate, newer rust-overlay used *only* to provide the exact stable
+    # toolchain Verus was built against (see nix/packages/verus.nix). Kept
+    # distinct from `rust-overlay` so bumping it never disturbs the firmware's
+    # (undated) nightly toolchain.
+    rust-overlay-verus.url = "github:oxalica/rust-overlay";
+    rust-overlay-verus.inputs.nixpkgs.follows = "nixpkgs";
     treefmt-nix.inputs.nixpkgs.follows = "nixpkgs";
     treefmt-nix.url = "github:numtide/treefmt-nix";
   };

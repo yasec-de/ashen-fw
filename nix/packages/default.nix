@@ -7,12 +7,15 @@ flakeInputs.nixpkgs-lib.lib.genAttrs
   (
     system:
     let
-      inherit (flakeInputs.self.legacyPackages.${system})
-        ashen-fw
-        ;
+      pkgs = flakeInputs.self.legacyPackages.${system};
+      inherit (pkgs) ashen-fw;
     in
     {
       inherit ashen-fw;
       default = ashen-fw;
+    }
+    # Verus only ships a prebuilt x86_64-linux release.
+    // flakeInputs.nixpkgs-lib.lib.optionalAttrs (system == "x86_64-linux") {
+      inherit (pkgs) verus cobs-proof;
     }
   )

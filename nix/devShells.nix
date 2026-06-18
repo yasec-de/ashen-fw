@@ -17,11 +17,14 @@ flakeInputs.nixpkgs-lib.lib.genAttrs
         inputsFrom = [ pkgs.ashen-fw ];
 
         # Add additional development-only tools
-        nativeBuildInputs = with pkgs; [
-          cargo-expand
-          cargo-bloat
-          cargo-binutils
-        ];
+        nativeBuildInputs =
+          (with pkgs; [
+            cargo-expand
+            cargo-bloat
+            cargo-binutils
+          ])
+          # Verus only ships a prebuilt x86_64-linux release.
+          ++ flakeInputs.nixpkgs-lib.lib.optional (system == "x86_64-linux") pkgs.verus;
 
         shellHook = ''
           function git_branch {
