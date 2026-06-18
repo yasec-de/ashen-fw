@@ -6,7 +6,7 @@ use alloc::vec;
 
 use embedded_io_async::{Read, Write};
 
-use crate::cobs;
+use crate::framing;
 use crate::noise_link::{Error, KeyStore, NoiseLink, Random, builder};
 use crate::protocol::{Disconnect, Envelope, Erase, Msg, PairRequest};
 
@@ -77,19 +77,19 @@ impl<T: Read + Write> NoiseLink<T> {
             .local_private_key(local_static_key)?
             .build_initiator()?;
 
-        let mut buf = vec![0u8; cobs::MAX_PAYLOAD_LEN];
+        let mut buf = vec![0u8; framing::MAX_PAYLOAD_LEN];
 
         // -> e
         let len = hs.write_message(&[], &mut buf)?;
-        cobs::write_frame(&mut io, &buf[..len]).await?;
+        framing::write_frame(&mut io, &buf[..len]).await?;
 
         // <- e, ee, s, es
-        let msg = cobs::read_frame(&mut io).await?;
+        let msg = framing::read_frame(&mut io).await?;
         hs.read_message(&msg, &mut buf)?;
 
         // -> s, se
         let len = hs.write_message(&[], &mut buf)?;
-        cobs::write_frame(&mut io, &buf[..len]).await?;
+        framing::write_frame(&mut io, &buf[..len]).await?;
 
         let transport = hs.into_transport_mode()?;
         let link = Self {

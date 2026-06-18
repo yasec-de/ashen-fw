@@ -16,6 +16,16 @@ required-features = ["embedded"]
 embedded-io = { version = "0.6.0" }
 embedded-io-async = { version = "0.6.1" }
 embassy-sync = { version = "0.7.2" }
+
+# Verus support libraries. These let the COBS `encode`/`decode` in `src/cobs.rs`
+# be the *same* source that `cargo verus verify` proves correct: a normal
+# `cargo build` erases the ghost (proof) code and compiles only the executable
+# bodies. Pinned to match the `verus` binary in nix/packages/verus.nix
+# (release 0.2026.06.14). `vstd` is used `no_std` (+ alloc) so it links into the
+# embedded firmware as well as host builds.
+vstd = { version = "=0.0.0-2026-06-14-0213", default-features = false, features = ["alloc"] }
+verus_builtin = "=0.0.0-2026-05-17-0151"
+verus_builtin_macros = "=0.0.0-2026-06-14-0213"
 embassy-futures = { version = "0.1.2" }
 subtle = { version = "2", default-features = false }
 snow = { version = "0.10.0", default-features = false, features = ["default-resolver", "use-curve25519", "use-chacha20poly1305", "use-sha2"] }
@@ -69,3 +79,10 @@ strip = false       # Don't strip, we need symbols for debugging
 
 [build-dependencies]
 micropb-gen = "0.6.0"
+
+# The `verus!` macro in `src/cobs/codec.rs` expands to code annotated with
+# `cfg(verus_keep_ghost)` (set only when the `verus` verifier compiles the file,
+# see `nix build .#cobs-proof`). Declare the cfg so a normal `cargo build` does
+# not warn about it being unexpected.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(verus_keep_ghost)', 'cfg(verus_verify_core)'] }

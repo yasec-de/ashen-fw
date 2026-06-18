@@ -1,9 +1,9 @@
 //! Secure transport: Noise_XX over COBS-framed bytes (e.g. a USART link),
 //! with trust-on-first-use (TOFU) verification of the remote static key.
 //!
-//! Wire framing: each message is encoded with [`crate::cobs`] and terminated
+//! Wire framing: each message is encoded with [`crate::framing`] and terminated
 //! by a `0x00` delimiter byte, so frames may be of any length up to
-//! [`cobs::MAX_PAYLOAD_LEN`]. If a frame is malformed (bad COBS encoding or
+//! [`framing::MAX_PAYLOAD_LEN`]. If a frame is malformed (bad COBS encoding or
 //! larger than expected), the implementation resynchronizes by discarding
 //! bytes up to the next `0x00` delimiter and continues with the following
 //! frame.
@@ -22,7 +22,7 @@ use snow::types::{Cipher, Dh, Hash};
 pub use snow::types::Random;
 use snow::{Builder, TransportState};
 
-use crate::cobs;
+use crate::framing;
 
 /// Noise handshake pattern used for this link.
 pub const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
@@ -31,7 +31,7 @@ pub const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
 /// Errors that can occur while operating a [`NoiseLink`].
 #[derive(Debug)]
 pub enum Error {
-    Transport(cobs::Error),
+    Transport(framing::Error),
     Crypto(snow::Error),
     Protocol,
     AlreadyKeyed,
@@ -54,8 +54,8 @@ impl From<snow::Error> for Error {
     }
 }
 
-impl From<cobs::Error> for Error {
-    fn from(e: cobs::Error) -> Self {
+impl From<framing::Error> for Error {
+    fn from(e: framing::Error) -> Self {
         Error::Transport(e)
     }
 }
@@ -138,18 +138,18 @@ impl<T: Read + Write> NoiseLink<T> {
             .local_private_key(local_static_key)?
             .build_responder()?;
 
-        let mut buf = vec![0u8; cobs::MAX_PAYLOAD_LEN];
+        let mut buf = vec![0u8; framing::MAX_PAYLOAD_LEN];
 
         // -> e
-        let msg = cobs::read_frame(&mut io).await?;
+        let msg = framing::read_frame(&mut io).await?;
         hs.read_message(&msg, &mut buf)?;
 
         // <- e, ee, s, es
         let len = hs.write_message(&[], &mut buf)?;
-        cobs::write_frame(&mut io, &buf[..len]).await?;
+        framing::write_frame(&mut io, &buf[..len]).await?;
 
         // -> s, se
-        let msg = cobs::read_frame(&mut io).await?;
+        let msg = framing::read_frame(&mut io).await?;
         hs.read_message(&msg, &mut buf)?;
         let transport = hs.into_transport_mode()?;
 
@@ -216,13 +216,13 @@ impl<T: Read + Write> NoiseLink<T> {
         const TAG_LEN: usize = 16;
         let mut ciphertext = vec![0u8; payload.len() + TAG_LEN];
         let len = self.transport.write_message(payload, &mut ciphertext)?;
-        cobs::write_frame(&mut self.io, &ciphertext[..len]).await?;
+        framing::write_frame(&mut self.io, &ciphertext[..len]).await?;
         Ok(())
     }
 
     /// Receives and decrypts a single transport message.
     pub async fn receive(&mut self) -> Result<Vec<u8>, Error> {
-        let msg = cobs::read_frame(&mut self.io).await?;
+        let msg = framing::read_frame(&mut self.io).await?;
         let mut plaintext = vec![0u8; msg.len()];
         let len = self.transport.read_message(&msg, &mut plaintext)?;
         plaintext.truncate(len);

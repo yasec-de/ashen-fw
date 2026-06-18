@@ -1,24 +1,34 @@
-//! COBS (Consistent Overhead Byte Stuffing) implementation.
-//! For details on COBS, see this paper: https://www.stuartcheshire.org/papers/COBSforToN.pdf
+//! Formally verified COBS encode/decode routines
+//! 
+//! This file will be built for both verus verification, as well as as part of
+//! the actual firmware image. To avoid a dependency mess, it has minimal
+//! dependencies and the rest of the COBS framing code handling IO etc. is
+//! fractored out into framing.rs
 //!
-//! Encodes an arbitrary byte slice (which may contain `0x00` bytes) into a
-//! form that is guaranteed not to contain `0x00`, so that `0x00` can be used
-//! as an unambiguous frame delimiter on a byte stream. Frames may be of any
-//! length; long inputs are split into chained sub-blocks of up to 254 bytes
-//! each (the standard COBS "0xFF" chaining case).
+//! Verified properties:
+//!
+//!   * `encode` — the output never contains a `0x00` byte
+//!
+//!   * `decode` — on input free of `0x00` bytes, decoding never
+//!     panics, never overflows, and never indexes out of bounds
+//!
+//!   * round trip — `decode(encode(s)) == Ok(s)` for every input `s`
+//!     (see `decode_encode_roundtrip`)
 
+// `Vec` is in scope via the std prelude when Verus compiles this file
+// standalone, but the firmware is `no_std`, so import it from `alloc`
+// explicitly. `extern crate alloc` is redundant with the crate root in the
+// firmware build and supplies the crate in the standalone verifier build.
+extern crate alloc;
 use alloc::vec::Vec;
-use embedded_io_async::{Read, Write};
-use core::fmt;
+use vstd::prelude::*;
+use vstd::slice::slice_subrange;
 
+verus! {
 
-/// Maximum number of plaintext payload bytes in a single COBS frame
-pub const MAX_PAYLOAD_LEN: usize = 1024;
-
-/// Maximum size of a COBS frame after encoding
-pub const MAX_FRAME_LEN: usize = MAX_PAYLOAD_LEN + MAX_PAYLOAD_LEN / 254 + 2;
-
-/// Errors that can occur while decoding a COBS-encoded buffer.
+/// Errors that can occur while decoding a COBS-encoded buffer. `Io` and
+/// `Overflow` belong to the frame I/O layer (see the `framing` module) and are
+/// never produced by `decode` itself.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {
     /// During decoding, we ran out of input data while decoding
@@ -29,305 +39,404 @@ pub enum Error {
     Overflow,
 }
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Error::Truncated => write!(f, "Truncated COBS frame"),
-            Error::Io => write!(f, "I/O error"),
-            Error::Overflow => write!(f, "COBS frame too large"),
+/// Pure model of [`decode`], used only for verification. Mirrors the executable
+/// `decode` exactly: it consumes one COBS block from the front (a non-zero code
+/// byte followed by `code - 1` data bytes), appends the implicit `0x00`
+/// separator unless the block is a `0xFF` chaining block or the buffer ends, and
+/// recurses on the remainder. Returns `None` for the truncated case (a code byte
+/// claiming more data than is present) and for a `0x00` code byte (which the
+/// executable `decode` rejects via its precondition).
+pub open spec fn decode_spec(input: Seq<u8>) -> Option<Seq<u8>>
+    decreases input.len(),
+{
+    if input.len() == 0 {
+        Some(Seq::empty())
+    } else {
+        let code = input[0] as int;
+        if code == 0 {
+            None
+        } else {
+            let data_len = code - 1;
+            if data_len > input.len() - 1 {
+                None
+            } else {
+                let data = input.subrange(1, 1 + data_len);
+                let rest = input.subrange(1 + data_len, input.len() as int);
+                match decode_spec(rest) {
+                    Some(tail) => {
+                        if code != 0xff && rest.len() > 0 {
+                            Some(data + seq![0u8] + tail)
+                        } else {
+                            Some(data + tail)
+                        }
+                    }
+                    None => None,
+                }
+            }
         }
+    }
+}
+
+/// Whether the final COBS block of a (decodable) buffer is a `0xFF` chaining
+/// block — i.e. one that carries no implicit trailing `0x00`. Used by the
+/// framing lemma below to decide whether concatenating more data introduces a
+/// separator zero.
+spec fn last_is_ff(c: Seq<u8>) -> bool
+    decreases c.len(),
+{
+    if c.len() == 0 {
+        false
+    } else {
+        let code = c[0] as int;
+        if code == 0 {
+            false
+        } else {
+            let data_len = code - 1;
+            if data_len > c.len() - 1 {
+                false
+            } else {
+                let rest = c.subrange(1 + data_len, c.len() as int);
+                if rest.len() == 0 {
+                    code == 0xff
+                } else {
+                    last_is_ff(rest)
+                }
+            }
+        }
+    }
+}
+
+/// Separator inserted between the decodings of `c` and `t` when the buffers are
+/// concatenated: the last block of `c` gains its implicit `0x00` exactly when
+/// `c` is non-empty, ends in a non-`0xFF` block, and is followed by more data.
+spec fn concat_sep(c: Seq<u8>, t: Seq<u8>) -> Seq<u8> {
+    if c.len() == 0 || t.len() == 0 || last_is_ff(c) {
+        Seq::<u8>::empty()
+    } else {
+        seq![0u8]
+    }
+}
+
+/// Framing lemma: `decode_spec` is front-recursive, but `encode` grows the
+/// *last* block. This relates decoding a concatenation to decoding the parts, so
+/// extending the tail can be reasoned about locally. When `c` decodes
+/// (`decode_spec(c)` is `Some`), decoding `c + t` is `decode_spec(c)` followed by
+/// the separator and `decode_spec(t)` (or `None` when `t` itself truncates).
+proof fn lemma_decode_concat(c: Seq<u8>, t: Seq<u8>)
+    requires
+        decode_spec(c) is Some,
+    ensures
+        decode_spec(t) is Some ==> decode_spec(c + t) == Some(
+            decode_spec(c)->Some_0 + concat_sep(c, t) + decode_spec(t)->Some_0,
+        ),
+        decode_spec(t) is None ==> decode_spec(c + t) is None,
+    decreases c.len(),
+{
+    if c.len() == 0 {
+        assert(c + t =~= t);
+        if decode_spec(t) is Some {
+            assert(decode_spec(c)->Some_0 + concat_sep(c, t) + decode_spec(t)->Some_0
+                =~= decode_spec(t)->Some_0);
+        }
+    } else {
+        let code = c[0] as int;
+        let data_len = code - 1;
+        let rest_c = c.subrange(1 + data_len, c.len() as int);
+        // First block of `c + t` is the first block of `c`.
+        assert((c + t)[0] == c[0]);
+        assert((c + t).subrange(1, 1 + data_len) =~= c.subrange(1, 1 + data_len));
+        assert((c + t).subrange(1 + data_len, (c + t).len() as int) =~= rest_c + t);
+        // `decode_spec(c)` is Some, so its first block is well-formed and
+        // `decode_spec(rest_c)` is Some; recurse on the shorter `rest_c`.
+        lemma_decode_concat(rest_c, t);
+    }
+}
+
+/// A single COBS block `[code] ++ data` (with exactly `code - 1` data bytes)
+/// decodes to its data bytes. Covers both short blocks (`code <= 0xfe`) and a
+/// full `0xFF` chaining block.
+proof fn lemma_decode_single_block(code: u8, data: Seq<u8>)
+    requires
+        code >= 1,
+        data.len() == code - 1,
+    ensures
+        decode_spec(seq![code] + data) == Some(data),
+{
+    let b = seq![code] + data;
+    assert(b.len() == code);
+    assert(b[0] == code);
+    assert(b.subrange(1, 1 + (code - 1)) =~= data);
+    assert(b.subrange(1 + (code - 1), b.len() as int) =~= Seq::<u8>::empty());
+    reveal_with_fuel(decode_spec, 2);
+    assert(data + Seq::<u8>::empty() =~= data);
+}
+
+/// Companion to [`lemma_decode_concat`]: when `c` decodes and `t` is non-empty,
+/// the last block of `c + t` is the last block of `t`.
+proof fn lemma_last_is_ff_concat(c: Seq<u8>, t: Seq<u8>)
+    requires
+        decode_spec(c) is Some,
+        t.len() > 0,
+    ensures
+        last_is_ff(c + t) == last_is_ff(t),
+    decreases c.len(),
+{
+    if c.len() == 0 {
+        assert(c + t =~= t);
+    } else {
+        let code = c[0] as int;
+        let data_len = code - 1;
+        let rest_c = c.subrange(1 + data_len, c.len() as int);
+        assert((c + t)[0] == c[0]);
+        assert((c + t).subrange(1 + data_len, (c + t).len() as int) =~= rest_c + t);
+        lemma_last_is_ff_concat(rest_c, t);
     }
 }
 
 /// Encodes `input` into COBS form. The result never contains a `0x00` byte.
 ///
 /// The caller is responsible for adding `0x00` frame delimiters as necessary.
-pub fn encode(input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len() + input.len() / 254 + 1);
-    let mut code_pos = 0;
-    let mut code = 1u8;
+///
+/// Verified: the returned buffer never contains a `0x00` byte, and it decodes
+/// back to `input` exactly (`decode_spec(out@) == Some(input@)`), which —
+/// combined with `decode`'s refinement of `decode_spec` — gives the round-trip
+/// `decode(encode(s)) == Ok(s)` (see [`decode_encode_roundtrip`]).
+pub fn encode(input: &[u8]) -> (out: Vec<u8>)
+    ensures
+        forall|k: int| 0 <= k < out.len() ==> out[k] != 0,
+        decode_spec(out@) == Some(input@),
+{
+    let mut out: Vec<u8> = Vec::new();
+    let mut code_pos: usize = 0;
+    let mut code: u8 = 1;
     out.push(0); // Reserve one spot for the code byte
+    proof {
+        lemma_decode_single_block(1u8, Seq::<u8>::empty());
+        assert(seq![1u8] + Seq::<u8>::empty() =~= seq![1u8]);
+        assert(out@.update(0, 1u8) =~= seq![1u8]);
+        assert(out@.subrange(0, 0) =~= Seq::<u8>::empty());
+        assert(input@.subrange(0, 0) =~= Seq::<u8>::empty());
+    }
 
-    for &byte in input {
+    let mut j: usize = 0;
+    while j < input.len()
+        invariant
+            // `code_pos` always points at a live, still-reserved code-byte slot.
+            code_pos < out.len(),
+            // The current (open) block spans `[code_pos, out.len())`: its code
+            // byte plus `code - 1` data bytes.
+            out@.len() == code_pos + code,
+            1 <= code <= 0xfe,
+            j <= input.len(),
+            // Every byte written so far is non-zero, except the reserved
+            // code-byte slot — overwritten with a non-zero `code` before it is
+            // left behind.
+            forall|k: int| 0 <= k < out.len() && k != code_pos as int ==> out[k] != 0,
+            // The committed blocks (everything before the current code byte)
+            // form a valid, fully-decodable buffer.
+            decode_spec(out@.subrange(0, code_pos as int)) is Some,
+            // Closing the current block (writing `code` into its code-byte slot)
+            // yields a buffer that decodes to exactly the input seen so far.
+            decode_spec(out@.update(code_pos as int, code)) == Some(input@.subrange(0, j as int)),
+        decreases input.len() - j,
+    {
+        let ghost out_pre = out@;
+        let ghost cp = code_pos as int;
+        let ghost c_pre = out_pre.subrange(0, cp);
+        let ghost data = out_pre.subrange(cp + 1, out_pre.len() as int);
+        let ghost b_pre = seq![code] + data;
+        let ghost patched_pre = out_pre.update(cp, code);
+        proof {
+            // `patched_pre` splits into the committed prefix `c_pre` and the
+            // closed current block `b_pre = [code] ++ data` (which has `code - 1`
+            // data bytes), so a lone `b_pre` decodes to `data`.
+            assert(data.len() == code - 1);
+            assert(patched_pre.subrange(cp, out_pre.len() as int) =~= b_pre);
+            assert(patched_pre =~= c_pre + b_pre);
+            lemma_decode_single_block(code, data);
+            // Re-express the invariant via the framing lemma.
+            lemma_decode_concat(c_pre, b_pre);
+        }
+
+        let byte = input[j];
         if byte == 0 {
-            out[code_pos] = code;
+            out.set(code_pos, code);
             code_pos = out.len();
             out.push(0);
             code = 1;
-
+            proof {
+                // New committed prefix is exactly `patched_pre`; the new open
+                // block is the empty `[1]`. The closed short block is not a
+                // `0xFF` block, so concatenating gains the implicit separator
+                // `0x00` — which is exactly the input's zero byte at `j`.
+                lemma_last_is_ff_concat(c_pre, b_pre);
+                lemma_decode_single_block(1u8, Seq::<u8>::empty());
+                assert(seq![1u8] + Seq::<u8>::empty() =~= seq![1u8]);
+                assert(out@.subrange(0, code_pos as int) =~= patched_pre);
+                assert(out@.update(code_pos as int, 1u8) =~= patched_pre + seq![1u8]);
+                lemma_decode_concat(patched_pre, seq![1u8]);
+                assert(input@.subrange(0, j as int) + seq![0u8] =~= input@.subrange(0, j + 1));
+            }
         } else {
             out.push(byte);
-            code += 1;
+            code = code + 1;
 
             if code == 0xff {
-                out[code_pos] = 0xff;
+                out.set(code_pos, 0xff);
                 code_pos = out.len();
                 out.push(0);
                 code = 1;
+                proof {
+                    // The current block fills up into a `0xFF` chaining block of
+                    // 254 data bytes, then a fresh empty `[1]` block opens. A
+                    // `0xFF` block carries no implicit separator, so the new
+                    // empty block adds nothing.
+                    let b_closed = seq![0xffu8] + (data + seq![byte]);
+                    assert((data + seq![byte]).len() == 0xffu8 - 1);
+                    lemma_decode_single_block(0xffu8, data + seq![byte]);
+                    assert(out@.subrange(0, code_pos as int) =~= c_pre + b_closed);
+                    lemma_decode_concat(c_pre, b_closed);
+                    lemma_last_is_ff_concat(c_pre, b_closed);
+                    lemma_decode_single_block(1u8, Seq::<u8>::empty());
+                    assert(seq![1u8] + Seq::<u8>::empty() =~= seq![1u8]);
+                    assert(out@.update(code_pos as int, 1u8) =~= (c_pre + b_closed) + seq![1u8]);
+                    lemma_decode_concat(c_pre + b_closed, seq![1u8]);
+                    assert(last_is_ff(b_closed));
+                    assert(data + seq![byte] =~= b_pre.subrange(1, b_pre.len() as int) + seq![byte]);
+                    assert(input@.subrange(0, j as int) + seq![byte] =~= input@.subrange(0, j + 1));
+                }
+            } else {
+                proof {
+                    // The current block just grows by one data byte; `code_pos`
+                    // is unchanged, so the committed prefix and its separator are
+                    // unchanged.
+                    let b_post = seq![code] + (data + seq![byte]);
+                    assert((data + seq![byte]).len() == code - 1);
+                    lemma_decode_single_block(code, data + seq![byte]);
+                    // `code_pos` is unchanged, so the committed prefix is too.
+                    assert(out@.subrange(0, cp) =~= c_pre);
+                    assert(out@.update(cp, code) =~= c_pre + b_post);
+                    lemma_decode_concat(c_pre, b_post);
+                    assert(input@.subrange(0, j as int) + seq![byte] =~= input@.subrange(0, j + 1));
+                }
             }
         }
+        j += 1;
     }
 
-    out[code_pos] = code;
+    out.set(code_pos, code);
+    proof {
+        assert(input@.subrange(0, input@.len() as int) =~= input@);
+    }
     out
 }
 
 /// Decodes a COBS-encoded buffer (without leading or trailing `0x00` delimiters)
 /// back into the original bytes.
-pub fn decode(input: &[u8]) -> Result<Vec<u8>, Error> {
-    let mut out = Vec::with_capacity(input.len());
-    let mut i = 0;
-    while i < input.len() {
+///
+/// The caller must pass a buffer free of embedded `0x00` bytes.
+///
+/// Verified: the result matches the pure model [`decode_spec`] — `Ok(v)` exactly
+/// when the model yields `Some(v)`, and `Err(Truncated)` exactly when it yields
+/// `None`.
+pub fn decode(input: &[u8]) -> (res: Result<Vec<u8>, Error>)
+    requires
+        forall|k: int| 0 <= k < input.len() ==> input[k] != 0,
+    ensures
+        match res {
+            Ok(v) => decode_spec(input@) == Some(v@),
+            Err(e) => e == Error::Truncated && decode_spec(input@) == None::<Seq<u8>>,
+        },
+{
+    let mut out: Vec<u8> = Vec::new();
+    let mut i: usize = 0;
+    proof {
+        // Establish the invariant at entry: `subrange(0, len) == input@` and,
+        // since `out` is empty, `Seq::empty() + tail == tail`.
+        assert(input@.subrange(0, input@.len() as int) =~= input@);
+        if let Some(tail) = decode_spec(input@) {
+            assert(Seq::<u8>::empty() + tail =~= tail);
+        }
+    }
+    while i < input.len()
+        invariant
+            i <= input.len(),
+            forall|k: int| 0 <= k < input.len() ==> input[k] != 0,
+            decode_spec(input@) == match decode_spec(input@.subrange(i as int, input@.len() as int)) {
+                Some(tail) => Some(out@ + tail),
+                None => None::<Seq<u8>>,
+            },
+        decreases input.len() - i,
+    {
+        let ghost start = i as int;
+        let ghost sub = input@.subrange(start, input@.len() as int);
+        let ghost out_old = out@;
+        assert(sub[0] == input@[start]);
+
         let code = input[i] as usize;
         i += 1;
 
-        if code == 0 {
-            panic!("Caller passed buffer with embedded null bytes to cobs::decode");
-        }
-        
+        assert(code != 0);
+
         let data_len = code - 1;
-        if i + data_len > input.len() {
+        // Overflow-safe form of `i + data_len > input.len()`: with `i <=
+        // input.len()` from the loop invariant, this subtraction cannot wrap.
+        if data_len > input.len() - i {
+            // `decode_spec(sub)` truncates here too: same code byte, same
+            // `data_len > sub.len() - 1` check.
+            assert(decode_spec(sub) == None::<Seq<u8>>);
             return Err(Error::Truncated);
         }
 
-        out.extend_from_slice(&input[i..i + data_len]);
+        let ghost data = input@.subrange(i as int, i as int + data_len as int);
+        let ghost tail_in = input@.subrange(i as int + data_len as int, input@.len() as int);
+
+        out.extend_from_slice(slice_subrange(input, i, i + data_len));
         i += data_len;
-        if code != 0xFF && i < input.len() {
+        if code != 0xff && i < input.len() {
             out.push(0);
         }
+
+        proof {
+            // The data bytes and remaining suffix of `sub`, expressed as
+            // subranges of `input@`.
+            assert(sub.subrange(1, 1 + data_len as int) =~= data);
+            assert(sub.subrange(1 + data_len as int, sub.len() as int) =~= tail_in);
+            assert(tail_in =~= input@.subrange(i as int, input@.len() as int));
+            // `decode_spec(sub)` unfolds (fuel 1) to `Some(data (+ [0]) + tail)`
+            // where `tail == decode_spec(tail_in)`. The exec code appended
+            // exactly `data (+ [0])` to `out`. With the old invariant
+            // `decode_spec(input@) == map(decode_spec(sub), out_old + _)` and
+            // associativity of `+`, the invariant holds for the new `out`/`i`.
+            let tail = decode_spec(tail_in);
+            if code != 0xff && tail_in.len() > 0 {
+                assert(out@ =~= out_old + data + seq![0u8]);
+                assert(decode_spec(sub) matches Some(s) ==> s =~= data + seq![0u8] + tail->Some_0);
+            } else {
+                assert(out@ =~= out_old + data);
+            }
+        }
     }
+    assert(input@.subrange(i as int, input@.len() as int) =~= Seq::<u8>::empty());
     Ok(out)
 }
 
-pub async fn write_frame<T: Write>(io: &mut T, payload: &[u8]) -> Result<(), Error> {
-    let mut frame = encode(payload);
-
-    if frame.len() >= MAX_FRAME_LEN {
-        return Err(Error::Overflow)
-    }
-
-    frame.push(0x00);
-    io.write_all(&frame).await.map_err(|_| Error::Io)
+/// The round-trip theorem, stated so Verus checks it end to end: for any `s`,
+/// `decode(encode(s)) == Ok(s)`. `encode`'s post-condition gives
+/// `decode_spec(encode(s)@) == Some(s@)` (so `encode`'s output is zero-free and
+/// non-truncating, satisfying `decode`'s precondition and ruling out its `Err`
+/// branch), and `decode`'s refinement of `decode_spec` then forces the result to
+/// be `Ok(s)` — which the post-condition `r@ == s@` and the proven-safe `unwrap`
+/// witness. Compiled only during verification.
+#[cfg(verus_keep_ghost)]
+fn decode_encode_roundtrip(s: &[u8]) -> (r: Vec<u8>)
+    ensures
+        r@ == s@,
+{
+    let encoded = encode(s);
+    let result = decode(&encoded);
+    assert(decode_spec(encoded@) == Some(s@));
+    result.unwrap()
 }
 
-pub async fn sync_frame<T: Read>(io: &mut T) -> Result<(), Error> {
-    loop {
-        let mut byte = [0u8; 1];
-        io.read_exact(&mut byte).await.map_err(|_| Error::Io)?;
-
-        if byte[0] == 0x00 {
-            return Ok(())
-        }
-    }
-}
-
-/// Reads bytes up to the next `0x00` delimiter and COBS-decodes them.
-///
-/// If the frame exceeds [`MAX_FRAME_LEN`], bytes are still
-/// consumed up to (and including) the delimiter before returning
-/// [`Error::Overflow`]
-pub async fn read_frame<T: Read>(io: &mut T) -> Result<Vec<u8>, Error> {
-    let mut buf = Vec::new();
-    loop {
-        let mut byte = [0u8; 1];
-        io.read_exact(&mut byte).await.map_err(|_| Error::Io)?;
-
-        if byte[0] == 0x00 {
-            return decode(&buf)
-        }
-
-        if buf.len() < MAX_FRAME_LEN {
-            buf.push(byte[0]);
-        } else {
-            sync_frame(io).await?;
-            return Err(Error::Overflow)
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use alloc::vec;
-
-    fn round_trip(input: &[u8]) {
-        let encoded = encode(input);
-        assert!(
-            !encoded.contains(&0x00),
-            "encoded output must not contain 0x00"
-        );
-        let decoded = decode(&encoded).expect("decode failed");
-        assert_eq!(decoded, input);
-    }
-
-    #[test]
-    fn empty() {
-        round_trip(&[]);
-    }
-
-    #[test]
-    fn single_zero_byte() {
-        round_trip(&[0x00]);
-    }
-
-    #[test]
-    fn short_string_with_embedded_zero() {
-        round_trip(b"hello\x00world");
-    }
-
-    #[test]
-    fn no_zeros_short() {
-        round_trip(b"hello noise");
-    }
-
-    #[test]
-    fn exactly_one_block_254_bytes() {
-        let input: Vec<u8> = (0..254u32).map(|i| (i % 255 + 1) as u8).collect();
-        round_trip(&input);
-    }
-
-    #[test]
-    fn long_buffer_513_bytes_no_zeros() {
-        // 513 = 254 + 254 + 5, so this requires three chained COBS
-        // sub-blocks (two full 0xFF blocks plus a short trailing block).
-        let input: Vec<u8> = (0..513u32).map(|i| (i % 255 + 1) as u8).collect();
-        round_trip(&input);
-    }
-
-    #[test]
-    fn long_buffer_513_bytes_with_zeros() {
-        let input: Vec<u8> = (0..513u32).map(|i| (i % 7) as u8).collect();
-        round_trip(&input);
-    }
-
-    #[test]
-    #[should_panic]
-    fn decode_rejects_zero_code_byte() {
-        let _ = decode(&[0x00]);
-    }
-
-    #[test]
-    fn decode_rejects_truncated_block() {
-        // Code byte claims 4 data bytes follow, but only 2 are present.
-        assert_eq!(decode(&[0x05, 0x01, 0x02]), Err(Error::Truncated));
-    }
-
-    #[test]
-    fn known_vectors() {
-        assert_eq!(encode(&[]), vec![0x01]);
-        assert_eq!(encode(&[0x00]), vec![0x01, 0x01]);
-        assert_eq!(encode(&[0x01, 0x02, 0x03]), vec![0x04, 0x01, 0x02, 0x03]);
-        assert_eq!(encode(&[0x01, 0x00, 0x02]), vec![0x02, 0x01, 0x02, 0x02]);
-    }
-
-    /// An in-memory byte source/sink for testing [`read_frame`]/[`write_frame`].
-    struct SliceIo {
-        data: Vec<u8>,
-        pos: usize,
-        out: Vec<u8>,
-    }
-
-    impl SliceIo {
-        fn new(data: Vec<u8>) -> Self {
-            Self {
-                data,
-                pos: 0,
-                out: Vec::new(),
-            }
-        }
-    }
-
-    #[derive(Debug)]
-    struct SliceError;
-
-    impl embedded_io::Error for SliceError {
-        fn kind(&self) -> embedded_io::ErrorKind {
-            embedded_io::ErrorKind::Other
-        }
-    }
-
-    impl embedded_io::ErrorType for SliceIo {
-        type Error = SliceError;
-    }
-
-    impl Read for SliceIo {
-        async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-            if self.pos >= self.data.len() {
-                return Err(SliceError);
-            }
-            buf[0] = self.data[self.pos];
-            self.pos += 1;
-            Ok(1)
-        }
-    }
-
-    impl Write for SliceIo {
-        async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-            self.out.extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        async fn flush(&mut self) -> Result<(), Self::Error> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn frame_round_trip() {
-        embassy_futures::block_on(async {
-            let mut io = SliceIo::new(Vec::new());
-            write_frame(&mut io, b"hello world").await.unwrap();
-
-            let mut reader = SliceIo::new(io.out);
-            let frame = read_frame(&mut reader).await.unwrap();
-            assert_eq!(frame, b"hello world");
-        });
-    }
-
-    #[test]
-    fn resync_after_corrupt_frame() {
-        embassy_futures::block_on(async {
-            // A corrupt frame (a code byte claiming more data than follows,
-            // which is invalid COBS) followed by the delimiter, then a valid
-            // frame.
-            let mut data = vec![0x05, 0x00];
-            let mut good = encode(b"second frame");
-            good.push(0x00);
-            data.append(&mut good);
-
-            let mut io = SliceIo::new(data);
-
-            // First frame is corrupt.
-            assert!(matches!(read_frame(&mut io).await, Err(Error::Truncated)));
-
-            // Reader has resynchronized and can decode the next frame.
-            let frame = read_frame(&mut io).await.unwrap();
-            assert_eq!(frame, b"second frame");
-        });
-    }
-
-    #[test]
-    fn resync_after_oversized_frame() {
-        embassy_futures::block_on(async {
-            // A frame longer than MAX_FRAME_LEN (no zero bytes, so it's
-            // valid COBS, just too long), followed by the delimiter, then a
-            // valid frame.
-            let oversized: Vec<u8> = (0..MAX_FRAME_LEN + 10)
-                .map(|i| (i % 255 + 1) as u8)
-                .collect();
-            let mut data = encode(&oversized);
-            data.push(0x00);
-
-            let mut good = encode(b"after overflow");
-            good.push(0x00);
-            data.append(&mut good);
-
-            let mut io = SliceIo::new(data);
-
-            assert!(matches!(read_frame(&mut io).await, Err(Error::Overflow)));
-
-            let frame = read_frame(&mut io).await.unwrap();
-            assert_eq!(frame, b"after overflow");
-        });
-    }
-}
+} // verus!
