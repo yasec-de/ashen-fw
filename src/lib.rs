@@ -10,6 +10,8 @@ pub mod defmt_link;
 pub mod flash_keystore;
 #[cfg(target_os = "none")]
 pub mod hw_rng;
+#[cfg(target_os = "none")]
+pub mod sensors;
 pub mod noise_link;
 #[cfg(target_os = "none")]
 pub mod panic_link;

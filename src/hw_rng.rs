@@ -50,6 +50,20 @@ impl HwRng {
     pub fn new() -> Self {
         Self
     }
+
+    pub async fn read_word(&mut self) -> u32 {
+        let mut guard = RNG_DRIVER.lock().await;
+        let rng = guard.as_mut().expect("HwRng used before hw_rng::init()");
+
+        let mut word = [0u8; 4];
+        for _ in 0..Self::MAX_CONSECUTIVE_FAILURES {
+            if rng.async_fill_bytes(&mut word).await.is_ok() {
+                return u32::from_ne_bytes(word);
+            }
+        }
+
+        panic!("hardware RNG failed to recover");
+    }
 }
 
 impl Random for HwRng {

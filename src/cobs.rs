@@ -422,12 +422,7 @@ pub fn decode(input: &[u8]) -> (res: Result<Vec<u8>, Error>)
 }
 
 /// The round-trip theorem, stated so Verus checks it end to end: for any `s`,
-/// `decode(encode(s)) == Ok(s)`. `encode`'s post-condition gives
-/// `decode_spec(encode(s)@) == Some(s@)` (so `encode`'s output is zero-free and
-/// non-truncating, satisfying `decode`'s precondition and ruling out its `Err`
-/// branch), and `decode`'s refinement of `decode_spec` then forces the result to
-/// be `Ok(s)` — which the post-condition `r@ == s@` and the proven-safe `unwrap`
-/// witness. Compiled only during verification.
+/// `decode(encode(s)) == Ok(s)`.
 #[cfg(verus_keep_ghost)]
 fn decode_encode_roundtrip(s: &[u8]) -> (r: Vec<u8>)
     ensures
