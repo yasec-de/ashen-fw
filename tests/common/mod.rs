@@ -14,6 +14,16 @@ pub struct ChannelIo {
 #[derive(Debug)]
 pub struct ChannelError;
 
+impl std::fmt::Display for ChannelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "channel I/O error")
+    }
+}
+
+// embedded-io 0.7 requires `Error` types to also implement
+// `core::error::Error` (hence `Display`).
+impl std::error::Error for ChannelError {}
+
 impl embedded_io::Error for ChannelError {
     fn kind(&self) -> embedded_io::ErrorKind {
         embedded_io::ErrorKind::Other

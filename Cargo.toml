@@ -13,9 +13,9 @@ path = "src/main.rs"
 required-features = ["embedded"]
 
 [dependencies]
-embedded-io = { version = "0.6.0" }
-embedded-io-async = { version = "0.6.1" }
-embassy-sync = { version = "0.7.2" }
+embedded-io = { version = "0.7.1" }
+embedded-io-async = { version = "0.7.0" }
+embassy-sync = { version = "0.8.0" }
 
 # Verus support libraries. These let the COBS `encode`/`decode` in `src/cobs.rs`
 # be the *same* source that `cargo verus verify` proves correct: a normal
@@ -35,17 +35,17 @@ micropb = { version = "0.6.0", default-features = false, features = ["alloc", "e
 # default dependency set so that `ashen_fw::noise_link` and its tests build
 # and run for the host architecture.
 [target.'cfg(target_os = "none")'.dependencies]
-embassy-stm32 = { version = "0.4.0", features = ["defmt", "stm32g474rb", "unstable-pac", "time-driver-any", "exti", "memory-x", "single-bank"]  }
-embassy-sync = { version = "0.7.2", features = ["defmt"] }
-embassy-executor = { version = "0.9.0", features = ["arch-cortex-m", "executor-thread", "defmt"] }
-embassy-time = { version = "0.5.0", features = ["defmt", "defmt-timestamp-uptime", "tick-hz-32_768"] }
+embassy-stm32 = { version = "0.6.0", features = ["defmt", "stm32g474rb", "unstable-pac", "time-driver-any", "exti", "memory-x", "single-bank"]  }
+embassy-sync = { version = "0.8.0", features = ["defmt"] }
+embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread", "defmt"] }
+embassy-time = { version = "0.5.1", features = ["defmt", "defmt-timestamp-uptime", "tick-hz-32_768"] }
 
-defmt = "1.0.1"
+defmt = "1.1.0"
 
-cortex-m = { version = "0.7.6", features = ["inline-asm", "critical-section-single-core"] }
-cortex-m-rt = "0.7.0"
+cortex-m = { version = "0.7.7", features = ["inline-asm", "critical-section-single-core"] }
+cortex-m-rt = "0.7.5"
 critical-section = "1.2"
-heapless = { version = "0.8", default-features = false }
+heapless = { version = "0.9", default-features = false }
 embedded-hal = "0.2.6"
 static_cell = { version = "2" }
 portable-atomic = { version = "1.5", features = ["unsafe-assume-single-core"] }

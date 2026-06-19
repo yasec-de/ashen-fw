@@ -173,6 +173,16 @@ mod tests {
     #[derive(Debug)]
     struct SliceError;
 
+    impl core::fmt::Display for SliceError {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(f, "slice I/O error")
+        }
+    }
+
+    // embedded-io 0.7 requires `Error` types to also implement
+    // `core::error::Error` (hence `Display`).
+    impl core::error::Error for SliceError {}
+
     impl embedded_io::Error for SliceError {
         fn kind(&self) -> embedded_io::ErrorKind {
             embedded_io::ErrorKind::Other

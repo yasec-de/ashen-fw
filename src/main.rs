@@ -62,9 +62,9 @@ fn boxed_hw_rng() -> Box<dyn Random> {
 async fn main(spawner: Spawner) {
     let p = embassy_stm32::init(Default::default());
 
-    spawner
-        .spawn(blink(Output::new(p.PA5, Level::Low, Speed::Low)))
-        .expect("failed to spawn blink task");
+    spawner.spawn(
+        blink(Output::new(p.PA5, Level::Low, Speed::Low)).expect("failed to spawn blink task"),
+    );
 
     // Hand the RNG peripheral to `hw_rng`, which owns it for the rest of the
     // program and hands out `HwRng` handles on demand.
