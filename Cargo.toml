@@ -45,8 +45,6 @@ defmt = "1.1.0"
 cortex-m = { version = "0.7.7", features = ["inline-asm", "critical-section-single-core"] }
 cortex-m-rt = "0.7.5"
 critical-section = "1.2"
-heapless = { version = "0.9", default-features = false }
-embedded-hal = "0.2.6"
 static_cell = { version = "2" }
 portable-atomic = { version = "1.5", features = ["unsafe-assume-single-core"] }
 emballoc = "0.3.0"
@@ -58,7 +56,6 @@ default = []
 # --target thumbv7em-none-eabihf`. Disabled by default so that `cargo build`
 # and `cargo test` run host-side without extra flags.
 embedded = []
-debug-mode = []
 # Exposes `ashen_fw::test_util` outside of this crate's own test builds, for
 # use by the host-side integration tests under `tests/`. Enabled for those
 # via the `[dev-dependencies]` entry below.

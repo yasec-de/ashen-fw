@@ -39,19 +39,13 @@ pub trait PanicReport: Send {
     fn flush_log_queue(&mut self);
 }
 
-impl<T: Read + IoWrite + Send> PanicReport for NoiseLink<T> {
-    fn flush_log_queue(&mut self) {
-        let _ = embassy_futures::block_on(NoiseLink::flush_log_queue(self));
-    }
-}
-
 /// Allows registering a slot that is briefly empty while the link is being
 /// re-handshaked (see the session loop in `main`). A panic during that
 /// window simply produces no report.
 impl<T: Read + IoWrite + Send> PanicReport for Option<NoiseLink<T>> {
     fn flush_log_queue(&mut self) {
         if let Some(link) = self {
-            PanicReport::flush_log_queue(link);
+            let _ = embassy_futures::block_on(NoiseLink::flush_log_queue(link));
         }
     }
 }

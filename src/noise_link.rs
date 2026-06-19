@@ -171,13 +171,16 @@ impl<T: Read + Write> NoiseLink<T> {
         Ok(link)
     }
 
-    pub fn peer_key(&mut self) -> [u8; 32] {
-        let remote_static = self.transport
-            .get_remote_static()
-            .expect("XX responder always learns remote static");
+    fn remote_static_key(&self) -> [u8; 32] {
         let mut key = [0u8; 32];
-        key.copy_from_slice(remote_static);
+        key.copy_from_slice(
+            self.transport.get_remote_static().expect("XX responder always learns remote static"),
+        );
         key
+    }
+
+    pub fn peer_key(&mut self) -> [u8; 32] {
+        self.remote_static_key()
     }
 
     pub fn is_peer_trusted(&self) -> bool {
@@ -198,13 +201,7 @@ impl<T: Read + Write> NoiseLink<T> {
             return Err(Error::AlreadyKeyed);
         }
 
-        let remote_static = self.transport
-            .get_remote_static()
-            .expect("XX responder always learns remote static");
-        let mut key = [0u8; 32];
-        key.copy_from_slice(remote_static);
-        
-        keystore.trust(key);
+        keystore.trust(self.remote_static_key());
         self.peer_trusted = true;
         Ok(())
     }

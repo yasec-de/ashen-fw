@@ -72,21 +72,9 @@ impl Random for HwRng {
     /// [`Self::MAX_CONSECUTIVE_FAILURES`] consecutive failures.
     fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), snow::Error> {
         embassy_futures::block_on(async {
-            let mut guard = RNG_DRIVER.lock().await;
-            let rng = guard.as_mut().expect("HwRng used before hw_rng::init()");
-
-            let mut failures = 0u32;
-            loop {
-                match rng.async_fill_bytes(dest).await {
-                    Ok(()) => return,
-                    Err(_) => {
-                        failures += 1;
-                        assert!(
-                            failures < Self::MAX_CONSECUTIVE_FAILURES,
-                            "hardware RNG failed to recover",
-                        );
-                    }
-                }
+            for chunk in dest.chunks_mut(4) {
+                let bytes = self.read_word().await.to_ne_bytes();
+                chunk.copy_from_slice(&bytes[..chunk.len()]);
             }
         });
         Ok(())
