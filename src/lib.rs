@@ -5,6 +5,8 @@ extern crate alloc;
 pub mod cobs;
 pub mod framing;
 #[cfg(target_os = "none")]
+pub mod analog_sensors;
+#[cfg(target_os = "none")]
 pub mod defmt_link;
 #[cfg(target_os = "none")]
 pub mod flash_keystore;
