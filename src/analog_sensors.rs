@@ -1,258 +1,442 @@
-//! Analog watchdog over the STM32G4's ADC1.
+//! Continuous, hardware-assisted analog watchdog over ADC1.
 //!
-//! [`AnalogSensors`] owns ADC1, a DMA channel, and the two internal analog
-//! channels (VREFINT and the temperature sensor). It offers a handful of
-//! *polling* `check_*` methods that read a channel, convert the raw count into
-//! a physical quantity, and **panic** if the value falls outside the limits the
-//! caller passes in. The intent is a hard safety interlock: an out-of-range
-//! supply rail or junction temperature is treated as unrecoverable, so it trips
-//! the panic handler (which reports over the secure link, see
-//! [`crate::panic_link`]) rather than being swallowed.
+//! This replaces an earlier polling design with one that never stops watching.
+//! A single ADC (ADC1) is run in continuous mode using *both* of its conversion
+//! groups:
 //!
-//! # Calibration
+//! * The **regular group** scans `[VREFINT, ext0, ext1, ...]` into a DMA ring
+//!   buffer. VREFINT is always rank 0, so the sequence is non-empty even with no
+//!   external channels. [`run_regular_monitor`] reads the buffer on the DMA
+//!   half-transfer interrupt, derives the supply voltage (VDDA) from VREFINT, and
+//!   range-checks each external input in software (leaving room for richer
+//!   filtering later).
+//! * The **injected group** holds VREFINT and the internal temperature sensor,
+//!   auto-triggered after every regular scan (`JAUTO`), so both are sampled
+//!   continuously without their own DMA; their results live in `JDR0` (VREFINT)
+//!   and `JDR1` (temperature). The watchdog interrupt handler re-reads these
+//!   registers so it reports the value that *actually* tripped the watchdog, not
+//!   a stale cached one. (VREFINT is also a regular channel — see below.)
 //!
-//! Absolute ADC readings depend on the true supply/reference voltage (VDDA),
-//! which is not known a priori. We recover it from the factory-trimmed internal
-//! reference: VREFINT reads a fixed ~1.2 V, and the factory stores the raw count
-//! it produced at [`VREF_CALIB_MV`] (`VREFINTCAL`). Measuring VREFINT now gives
+//! Two hardware analog watchdogs provide the hard interlock:
 //!
-//! ```text
-//! VDDA = VREF_CALIB_MV * VREFINTCAL / vrefint_now
-//! ```
+//! * **AWD1** (with input filtering) watches the regular VREFINT channel, i.e.
+//!   the supply rail. Its thresholds are fixed: the VREFINT-count ↔ VDDA mapping
+//!   is constant (`VDDA = VREF_CALIB_MV * VREFINTCAL / vrefint`), so a VCC window
+//!   maps to a fixed VREFINT-count window (inverted: high VCC ⇒ low count).
+//! * **AWD2** watches the injected temperature channel. Its thresholds depend on
+//!   the live VDDA, so [`run_calibration`] recomputes them periodically.
 //!
-//! from which every other channel converts to millivolts. [`AnalogSensors::new`]
-//! calibrates once at construction, and the `check_*` methods recalibrate
-//! lazily whenever [`DEFAULT_CALIBRATION_INTERVAL`] (configurable via
-//! [`AnalogSensors::set_calibration_interval`]) has elapsed, so VDDA tracks slow
-//! supply drift without a dedicated task.
+//! When either watchdog trips, the `ADC1_2` interrupt fires and the handler
+//! **panics** with the offending channel and its reading converted to a physical
+//! unit (routed out over the secure link by [`crate::panic_link`]).
 //!
-//! # Usage
+//! embassy-stm32 has no analog-watchdog or `JAUTO` API for the G4, so the
+//! injected group and both watchdogs are configured through `embassy_stm32::pac`
+//! (the `unstable-pac` feature is enabled).
 //!
-//! The DMA channel's interrupt must be bound by the caller and the binding
-//! handed in, mirroring [`embassy_stm32::adc::Adc::read`]:
+//! # Wiring (caller's responsibility)
 //!
 //! ```ignore
 //! bind_interrupts!(struct Irqs {
 //!     DMA1_CH1 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA1_CH1>;
 //! });
 //!
-//! let mut sensors = AnalogSensors::new(p.ADC1, p.DMA1_CH1, Irqs).await;
-//! sensors.check_vcc_mv(3000, 3600).await;          // panics outside 3.0–3.6 V
-//! sensors.check_temperature_c(-40, 105).await;     // panics outside −40–105 °C
-//! sensors.check_external_mv("vbat_div", &mut vbat_chan, SampleTime::CYCLES247_5, 0, 1800).await;
+//! // DMA buffer length must be 2 * (1 + N_external) * K; the monitor's read
+//! // buffer (HALF) is exactly half of it.
+//! const N: usize = 1;                       // external channels
+//! const FRAME: usize = 1 + N;               // VREFINT + externals
+//! const HALF: usize = FRAME * 8;            // samples read per half-buffer
+//! const DMA_LEN: usize = HALF * 2;
+//! static DMA_BUF: StaticCell<[u16; DMA_LEN]> = StaticCell::new();
+//!
+//! let externals = [(p.PA0.degrade_adc(), SampleTime::CYCLES247_5)];
+//! let limits = [ExternalLimit { name: "vbat_div", min_mv: 0, max_mv: 1800 }];
+//! let cfg = WatchdogConfig {
+//!     vcc_min_mv: 3000, vcc_max_mv: 3600,
+//!     temp_min_c: -40, temp_max_c: 105,
+//!     awd1_filter: 4,
+//!     calibration_interval: DEFAULT_CALIBRATION_INTERVAL,
+//! };
+//!
+//! let rb = analog_sensors::init(p.ADC1, p.DMA1_CH1, Irqs, DMA_BUF.init([0; DMA_LEN]), externals, &cfg);
+//! spawner.must_spawn(regular_task(rb, limits));        // wraps run_regular_monitor::<HALF, N>
+//! spawner.must_spawn(calibration_task(cfg.calibration_interval)); // wraps run_calibration
 //! ```
 //!
-//! Note: ADC1 needs a kernel clock; configure the ADC clock source in the RCC
-//! config passed to [`embassy_stm32::init`], otherwise conversions never
-//! complete.
+//! ADC1 needs a kernel clock: configure the ADC clock source in the RCC config
+//! passed to [`embassy_stm32::init`], otherwise conversions never complete.
 
 use core::ptr::read_volatile;
+use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
+use cortex_m::peripheral::NVIC;
 use embassy_stm32::Peri;
 use embassy_stm32::adc::{
-    Adc, AdcChannel, AdcConfig, AnyAdcChannel, Resolution, RxDma, SampleTime, VrefInt,
-    resolution_to_max_count,
+    Adc, AdcChannel, AdcConfig, AnyAdcChannel, CONTINUOUS, RingBufferedAdc, Resolution, RxDma,
+    SampleTime, VREF_CALIB_MV,
 };
-use embassy_stm32::adc::VREF_CALIB_MV;
 use embassy_stm32::dma::InterruptHandler as DmaInterruptHandler;
 use embassy_stm32::interrupt::typelevel::Binding;
+use embassy_stm32::pac;
+use embassy_stm32::pac::Interrupt;
+use embassy_stm32::pac::adc::vals::{Awd1sgl, Exten};
+use embassy_stm32::pac::interrupt;
 use embassy_stm32::peripherals::ADC1;
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::{Duration, Timer};
 
 /// Resolution we run the ADC at; fixes the full-scale count.
 const ADC_RESOLUTION: Resolution = Resolution::BITS12;
+/// Full-scale count for [`ADC_RESOLUTION`] (`2**12 - 1`).
+const ADC_MAX_COUNT: u32 = 4095;
 
-/// Full-scale count for [`ADC_RESOLUTION`] (`2**bits - 1`).
-const ADC_MAX_COUNT: u32 = resolution_to_max_count(ADC_RESOLUTION);
+/// ADC channel numbers on ADC1 (STM32G4).
+const VREFINT_CH: u8 = 18;
+const TEMPERATURE_CH: u8 = 16;
 
-/// Sample time used for the slow internal channels (VREFINT, temperature),
-/// which both have long minimum sampling times. The longest setting keeps the
-/// readings valid across ADC-clock configurations at negligible cost given how
-/// rarely we poll.
+/// Sample time for the slow internal channels (VREFINT, temperature), which both
+/// have long minimum sampling times. The longest setting keeps them valid across
+/// ADC-clock configurations at negligible cost.
 const INTERNAL_SAMPLE_TIME: SampleTime = SampleTime::CYCLES640_5;
 
-/// Settling time allowed after enabling the internal reference and temperature
-/// sensor buffers before the first conversion (datasheet t_START, with margin).
-const INTERNAL_STARTUP: Duration = Duration::from_micros(200);
-
-/// Default interval between automatic VDDA recalibrations.
+/// Default interval between automatic VDDA recalibrations / AWD2 threshold updates.
 pub const DEFAULT_CALIBRATION_INTERVAL: Duration = Duration::from_secs(10);
 
-// Factory temperature-sensor calibration for the STM32G4 family. Each is a
-// right-aligned 12-bit raw ADC count captured at VDDA = `VREF_CALIB_MV`, the
-// first at 30 °C and the second at 130 °C (RM0440 / DS12288). stm32-metapac
-// maps `VREFINTCAL` but not these, so they are read straight from system
-// memory.
+// Factory temperature-sensor calibration for the STM32G4 family: right-aligned
+// 12-bit raw counts captured at VDDA = `VREF_CALIB_MV`, at 30 °C and 130 °C
+// (RM0440 / DS12288). stm32-metapac maps `VREFINTCAL` but not these.
 const TS_CAL1_ADDR: *const u16 = 0x1FFF_75A8 as *const u16;
 const TS_CAL2_ADDR: *const u16 = 0x1FFF_75CA as *const u16;
 const TS_CAL1_TEMP_C: i32 = 30;
 const TS_CAL2_TEMP_C: i32 = 130;
 
-/// Polling analog watchdog over ADC1; see the [module docs](self).
-///
-/// Generic over the DMA channel `D` driving the conversions and the interrupt
-/// binding `Irq` for that channel's interrupt.
-pub struct AnalogSensors<'d, D, Irq>
-where
-    D: RxDma<ADC1>,
-    Irq: Binding<D::Interrupt, DmaInterruptHandler<D>> + Copy + 'static,
-{
-    adc: Adc<'d, ADC1>,
-    dma: Peri<'d, D>,
-    irq: Irq,
-    vrefint: AnyAdcChannel<'d, ADC1>,
-    temperature: AnyAdcChannel<'d, ADC1>,
-    /// Factory `VREFINTCAL`: VREFINT raw count at [`VREF_CALIB_MV`].
-    vrefint_cal: u32,
-    /// Factory temperature calibration counts at 30 °C / 130 °C.
-    ts_cal1: i32,
-    ts_cal2: i32,
-    /// Most recent supply voltage (VDDA) estimate, in millivolts.
-    vdda_mv: u32,
-    calibration_interval: Duration,
-    last_calibration: Instant,
+// Configured limits, stored once by [`init`] so the interrupt handler can name
+// the window it crossed.
+static VCC_MIN_MV: AtomicU32 = AtomicU32::new(0);
+static VCC_MAX_MV: AtomicU32 = AtomicU32::new(0);
+static TEMP_MIN_C: AtomicI32 = AtomicI32::new(0);
+static TEMP_MAX_C: AtomicI32 = AtomicI32::new(0);
+
+/// Hardware-watchdog configuration for the internal rails.
+pub struct WatchdogConfig {
+    /// VCC (VDDA) lower bound, in millivolts. Below this AWD1 trips.
+    pub vcc_min_mv: u32,
+    /// VCC (VDDA) upper bound, in millivolts. Above this AWD1 trips.
+    pub vcc_max_mv: u32,
+    /// Junction-temperature lower bound, in °C. Below this AWD2 trips.
+    pub temp_min_c: i32,
+    /// Junction-temperature upper bound, in °C. Above this AWD2 trips.
+    pub temp_max_c: i32,
+    /// AWD1 input filter: number of consecutive out-of-range samples (0..=7)
+    /// required before the watchdog trips. Suppresses glitches.
+    pub awd1_filter: u8,
+    /// How often [`run_calibration`] re-derives VDDA and rewrites the AWD2
+    /// temperature thresholds.
+    pub calibration_interval: Duration,
 }
 
-impl<'d, D, Irq> AnalogSensors<'d, D, Irq>
+/// Range limits for one software-monitored external input.
+pub struct ExternalLimit {
+    /// Label used in the panic message when this input leaves its range.
+    pub name: &'static str,
+    pub min_mv: u32,
+    pub max_mv: u32,
+}
+
+/// Supply voltage (VDDA) in mV implied by a raw VREFINT count.
+fn vdda_from_vrefint(vrefint_raw: u16) -> u32 {
+    if vrefint_raw == 0 {
+        return 0;
+    }
+    let cal = pac::VREFINTCAL.data().read() as u32;
+    VREF_CALIB_MV * cal / vrefint_raw as u32
+}
+
+/// Reads the freshest supply voltage (VDDA) from the injected VREFINT result
+/// register (`JDR0`). Returns `0` before the first injected conversion completes.
+fn live_vdda_mv() -> u32 {
+    vdda_from_vrefint(pac::ADC1.jdr(0).read().jdata())
+}
+
+/// Converts a raw ratiometric count to millivolts using the given VDDA.
+fn raw_to_mv(raw: u16, vdda_mv: u32) -> u32 {
+    vdda_mv * raw as u32 / ADC_MAX_COUNT
+}
+
+/// Converts a raw temperature-sensor count to °C via the factory two-point
+/// calibration, rescaling the reading from the live VDDA to the calibration VDDA.
+fn temperature_c(raw: u16, vdda_mv: u32) -> i32 {
+    let cal1 = unsafe { read_volatile(TS_CAL1_ADDR) } as i32;
+    let cal2 = unsafe { read_volatile(TS_CAL2_ADDR) } as i32;
+    let ts = raw as i32 * vdda_mv as i32 / VREF_CALIB_MV as i32;
+    (TS_CAL2_TEMP_C - TS_CAL1_TEMP_C) * (ts - cal1) / (cal2 - cal1) + TS_CAL1_TEMP_C
+}
+
+/// Fixed AWD1 thresholds (VREFINT counts) for a VCC window. Higher VCC produces a
+/// *lower* VREFINT count, so the bounds invert.
+fn awd1_thresholds(vcc_min_mv: u32, vcc_max_mv: u32) -> (u16, u16) {
+    let cal = pac::VREFINTCAL.data().read() as u32;
+    let lt1 = (VREF_CALIB_MV * cal / vcc_max_mv) as u16;
+    let ht1 = (VREF_CALIB_MV * cal / vcc_min_mv) as u16;
+    (lt1, ht1)
+}
+
+/// AWD2 thresholds (8-bit, upper bits of the 12-bit result) for a temperature
+/// window at the given live VDDA.
+fn awd2_thresholds(temp_min_c: i32, temp_max_c: i32, vdda_mv: u32) -> (u8, u8) {
+    let cal1 = unsafe { read_volatile(TS_CAL1_ADDR) } as i32;
+    let cal2 = unsafe { read_volatile(TS_CAL2_ADDR) } as i32;
+    let raw = |t: i32| -> i32 {
+        let ts = (t - TS_CAL1_TEMP_C) * (cal2 - cal1) / (TS_CAL2_TEMP_C - TS_CAL1_TEMP_C) + cal1;
+        (ts * VREF_CALIB_MV as i32 / vdda_mv as i32).clamp(0, ADC_MAX_COUNT as i32)
+    };
+    let lt2 = (raw(temp_min_c) >> 4) as u8;
+    let ht2 = (raw(temp_max_c) >> 4) as u8;
+    (lt2, ht2)
+}
+
+/// An iterator that yields VREFINT first, then the caller's external channels,
+/// preserving `ExactSizeIterator` (which [`Adc::into_ring_buffered`] requires and
+/// `core::iter::Chain` does not provide).
+struct RegularSequence<'d, I> {
+    head: Option<(AnyAdcChannel<'d, ADC1>, SampleTime)>,
+    rest: I,
+}
+
+impl<'d, I> Iterator for RegularSequence<'d, I>
 where
-    D: RxDma<ADC1>,
-    Irq: Binding<D::Interrupt, DmaInterruptHandler<D>> + Copy + 'static,
+    I: ExactSizeIterator<Item = (AnyAdcChannel<'d, ADC1>, SampleTime)>,
 {
-    pub async fn new(adc: Peri<'d, ADC1>, dma: Peri<'d, D>, irq: Irq) -> Self {
-        let config = AdcConfig {
-            resolution: Some(ADC_RESOLUTION),
-            ..Default::default()
-        };
-        let adc = Adc::new(adc, config);
+    type Item = (AnyAdcChannel<'d, ADC1>, SampleTime);
 
-        let vrefint_marker = adc.enable_vrefint();
-        let vrefint_cal = vrefint_marker.calibrated_value() as u32;
-        let vrefint = vrefint_marker.degrade_adc();
-        let temperature = adc.enable_temperature().degrade_adc();
-
-        // Let the reference/temperature buffers settle before converting.
-        Timer::after(INTERNAL_STARTUP).await;
-
-        let mut this = Self {
-            adc,
-            dma,
-            irq,
-            vrefint,
-            temperature,
-            vrefint_cal,
-            ts_cal1: unsafe { read_volatile(TS_CAL1_ADDR) } as i32,
-            ts_cal2: unsafe { read_volatile(TS_CAL2_ADDR) } as i32,
-            vdda_mv: VREF_CALIB_MV, // Set on first cal
-            calibration_interval: DEFAULT_CALIBRATION_INTERVAL,
-            last_calibration: Instant::now(),
-        };
-        this.calibrate().await;
-        this
-    }
-
-    pub fn set_calibration_interval(&mut self, interval: Duration) {
-        self.calibration_interval = interval;
-    }
-
-    pub fn supply_mv(&self) -> u32 {
-        self.vdda_mv
-    }
-
-    pub async fn calibrate(&mut self) {
-        let raw = Self::read_channel(
-            &mut self.adc,
-            &mut self.dma,
-            self.irq,
-            &mut self.vrefint,
-            INTERNAL_SAMPLE_TIME,
-        )
-        .await;
-        assert!(raw != 0, "VREFINT read back as zero; is the ADC clock enabled?");
-        // VDDA = VREF_CALIB_MV * VREFINTCAL / VREFINT_now
-        self.vdda_mv = VREF_CALIB_MV * self.vrefint_cal / raw as u32;
-        self.last_calibration = Instant::now();
-    }
-
-    async fn ensure_calibrated(&mut self) {
-        if self.last_calibration.elapsed() >= self.calibration_interval {
-            self.calibrate().await;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.head.take() {
+            Some(head) => Some(head),
+            None => self.rest.next(),
         }
     }
 
-    pub async fn check_temperature_c(&mut self, min_c: i32, max_c: i32) {
-        self.ensure_calibrated().await;
-        let raw = Self::read_channel(
-            &mut self.adc,
-            &mut self.dma,
-            self.irq,
-            &mut self.temperature,
-            INTERNAL_SAMPLE_TIME,
-        )
-        .await;
-        let temp_c = self.raw_to_temperature_c(raw);
-        assert_within("die temperature", "C", temp_c, min_c, max_c);
-    }
-
-    pub async fn check_vcc_mv(&mut self, min_mv: u32, max_mv: u32) {
-        self.calibrate().await;
-        assert_within("VCC", "mV", self.vdda_mv as i32, min_mv as i32, max_mv as i32);
-    }
-
-    pub async fn check_external_mv(
-        &mut self,
-        name: &str,
-        channel: &mut AnyAdcChannel<'d, ADC1>,
-        sample_time: SampleTime,
-        min_mv: u32,
-        max_mv: u32,
-    ) {
-        self.ensure_calibrated().await;
-        let raw = Self::read_channel(&mut self.adc, &mut self.dma, self.irq, channel, sample_time).await;
-        let mv = self.raw_to_mv(raw);
-        assert_within(name, "mV", mv as i32, min_mv as i32, max_mv as i32);
-    }
-
-    fn raw_to_mv(&self, raw: u16) -> u32 {
-        self.vdda_mv * raw as u32 / ADC_MAX_COUNT
-    }
-
-    fn raw_to_temperature_c(&self, raw: u16) -> i32 {
-        let ts_data = raw as i32 * self.vdda_mv as i32 / VREF_CALIB_MV as i32;
-        (TS_CAL2_TEMP_C - TS_CAL1_TEMP_C) * (ts_data - self.ts_cal1) / (self.ts_cal2 - self.ts_cal1)
-            + TS_CAL1_TEMP_C
-    }
-
-    /// Performs one async DMA conversion of a single channel and returns the raw
-    /// count. Takes the constituent fields by individual borrow so the caller
-    /// can also hold a disjoint `&mut` to the channel being read.
-    async fn read_channel(
-        adc: &mut Adc<'d, ADC1>,
-        dma: &mut Peri<'d, D>,
-        irq: Irq,
-        channel: &mut AnyAdcChannel<'d, ADC1>,
-        sample_time: SampleTime,
-    ) -> u16 {
-        let mut reading = [0u16; 1];
-        adc.read(
-            dma.reborrow(),
-            irq,
-            [(channel, sample_time)].into_iter(),
-            &mut reading,
-        )
-        .await;
-        reading[0]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.rest.len() + self.head.is_some() as usize;
+        (n, Some(n))
     }
 }
 
-fn assert_within(name: &str, unit: &str, value: i32, min: i32, max: i32) {
-    if value < min || value > max {
+impl<'d, I> ExactSizeIterator for RegularSequence<'d, I> where
+    I: ExactSizeIterator<Item = (AnyAdcChannel<'d, ADC1>, SampleTime)>
+{
+}
+
+/// Sets up ADC1 and returns the running regular-group ring buffer.
+///
+/// Configures the regular DMA scan (`[VREFINT, externals...]`), the injected
+/// temperature channel (auto-triggered via `JAUTO`), and watchdogs AWD1 (VCC) and
+/// AWD2 (temperature). The watchdog *interrupts* stay masked until
+/// [`run_calibration`] completes its first pass, so a settling supply at power-on
+/// cannot trip a spurious panic. Conversions are started before returning.
+///
+/// `dma_buf.len()` must be `2 * (1 + N) * K` for some `K >= 1`; the monitor's read
+/// buffer is exactly `dma_buf.len() / 2`.
+pub fn init<'d, D, Irq, const N: usize>(
+    adc: Peri<'d, ADC1>,
+    dma: Peri<'d, D>,
+    irq: Irq,
+    dma_buf: &'d mut [u16],
+    external: [(AnyAdcChannel<'d, ADC1>, SampleTime); N],
+    cfg: &WatchdogConfig,
+) -> RingBufferedAdc<'d, ADC1>
+where
+    D: RxDma<ADC1>,
+    Irq: Binding<D::Interrupt, DmaInterruptHandler<D>> + 'd,
+{
+    VCC_MIN_MV.store(cfg.vcc_min_mv, Ordering::Relaxed);
+    VCC_MAX_MV.store(cfg.vcc_max_mv, Ordering::Relaxed);
+    TEMP_MIN_C.store(cfg.temp_min_c, Ordering::Relaxed);
+    TEMP_MAX_C.store(cfg.temp_max_c, Ordering::Relaxed);
+
+    let adc = Adc::new(
+        adc,
+        AdcConfig {
+            resolution: Some(ADC_RESOLUTION),
+            ..Default::default()
+        },
+    );
+
+    // Enable the internal channels (sets the common-block buffer enables). The
+    // temperature marker is dropped; the injected group references it by channel
+    // number through the PAC below.
+    let vrefint = adc.enable_vrefint().degrade_adc();
+    let _temperature = adc.enable_temperature();
+
+    let frame_len = 1 + N;
+    let sequence = RegularSequence {
+        head: Some((vrefint, INTERNAL_SAMPLE_TIME)),
+        rest: external.into_iter(),
+    };
+
+    // Regular group: continuous scan into the DMA ring buffer. This leaves the
+    // ADC enabled but not started (ADSTART = 0), so the PAC writes below are legal.
+    let mut rb = adc.into_ring_buffered(dma, dma_buf, irq, sequence, CONTINUOUS, Exten::DISABLED);
+    rb.set_alignment(frame_len);
+
+    // Injected group: VREFINT (JDR0) then temperature (JDR1), auto-triggered
+    // after each regular sequence. VREFINT is injected as well as regular so the
+    // watchdog ISR can re-read a fresh supply estimate from a register.
+    pac::ADC1.smpr2().modify(|w| {
+        w.set_smp((VREFINT_CH - 10) as usize, INTERNAL_SAMPLE_TIME);
+        w.set_smp((TEMPERATURE_CH - 10) as usize, INTERNAL_SAMPLE_TIME);
+    });
+    pac::ADC1.jsqr().modify(|w| {
+        w.set_jl(1); // two injected conversions
+        w.set_jsq(0, VREFINT_CH);
+        w.set_jsq(1, TEMPERATURE_CH);
+        w.set_jexten(Exten::DISABLED);
+    });
+    pac::ADC1.cfgr().modify(|w| {
+        w.set_jauto(true);
+        w.set_jdiscen(false);
+        // AWD1: filtered, single regular channel = VREFINT.
+        w.set_awd1en(true);
+        w.set_awd1sgl(Awd1sgl::SINGLE);
+        w.set_awd1ch(VREFINT_CH);
+    });
+
+    let (lt1, ht1) = awd1_thresholds(cfg.vcc_min_mv, cfg.vcc_max_mv);
+    pac::ADC1.tr1().modify(|w| {
+        w.set_lt1(lt1);
+        w.set_ht1(ht1);
+        w.set_awdfilt(cfg.awd1_filter);
+    });
+
+    // AWD2: temperature channel, provisional wide window until the first
+    // calibration writes real thresholds.
+    pac::ADC1.awd2cr().modify(|w| w.set_awd2ch(1 << TEMPERATURE_CH));
+    pac::ADC1.tr2().modify(|w| {
+        w.set_lt2(0);
+        w.set_ht2(0xFF);
+    });
+
+    // Keep watchdog interrupts masked until the first calibration.
+    pac::ADC1.ier().modify(|w| {
+        w.set_awd1ie(false);
+        w.set_awd2ie(false);
+    });
+
+    rb.start();
+    rb
+}
+
+/// Regular-group monitor: continuously reads `[VREFINT, externals...]` from the
+/// DMA ring buffer (waking on the half-transfer interrupt) and panics if any
+/// external input leaves its configured window. Each frame's external samples are
+/// converted with the VDDA derived from that same frame's VREFINT, so the supply
+/// estimate is always fresh.
+///
+/// `HALF` must equal `dma_buf.len() / 2` (and be a multiple of `1 + N`). `N` is the
+/// number of external channels and may be `0`. Wrap this in an
+/// `#[embassy_executor::task]` in the caller.
+pub async fn run_regular_monitor<const HALF: usize, const N: usize>(
+    mut rb: RingBufferedAdc<'static, ADC1>,
+    limits: [ExternalLimit; N],
+) -> ! {
+    let frame_len = 1 + N;
+    let mut buf = [0u16; HALF];
+
+    loop {
+        if rb.read(&mut buf).await.is_err() {
+            // Fell behind the DMA; the next read restarts the stream. The
+            // hardware watchdogs keep guarding VCC/temperature meanwhile.
+            defmt::warn!("analog_sensors: regular ADC ring-buffer overrun");
+            continue;
+        }
+
+        for frame in buf.chunks_exact(frame_len) {
+            let vdda_mv = vdda_from_vrefint(frame[0]);
+            for (j, limit) in limits.iter().enumerate() {
+                let mv = raw_to_mv(frame[1 + j], vdda_mv);
+                if mv < limit.min_mv || mv > limit.max_mv {
+                    defmt::panic!(
+                        "External ADC input {=str} out of range: {=u32} mV not within [{=u32}, {=u32}] mV",
+                        limit.name,
+                        mv,
+                        limit.min_mv,
+                        limit.max_mv,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Background calibration: periodically rewrites the live AWD2 temperature
+/// thresholds from the latest VDDA, and enables the watchdog interrupts after the
+/// first valid VDDA is available. Wrap in an `#[embassy_executor::task]`.
+pub async fn run_calibration(interval: Duration) -> ! {
+    loop {
+        Timer::after(interval).await;
+
+        let vdda_mv = live_vdda_mv();
+        if vdda_mv == 0 {
+            // No injected VREFINT conversion yet; conversions haven't run.
+            continue;
+        }
+
+        let (lt2, ht2) = awd2_thresholds(
+            TEMP_MIN_C.load(Ordering::Relaxed),
+            TEMP_MAX_C.load(Ordering::Relaxed),
+            vdda_mv,
+        );
+
+        // Update thresholds with the AWD2 interrupt masked to avoid a spurious
+        // trip from a transient mismatch during the write.
+        pac::ADC1.ier().modify(|w| w.set_awd2ie(false));
+        pac::ADC1.tr2().modify(|w| {
+            w.set_lt2(lt2);
+            w.set_ht2(ht2);
+        });
+        pac::ADC1.isr().write(|w| w.set_awd2(true)); // clear any pending flag
+
+        if !pac::ADC1.ier().read().awd1ie() {
+            // First valid calibration: clear stale flags and arm both watchdogs.
+            pac::ADC1.isr().write(|w| {
+                w.set_awd1(true);
+                w.set_awd2(true);
+            });
+            pac::ADC1.ier().modify(|w| {
+                w.set_awd1ie(true);
+                w.set_awd2ie(true);
+            });
+            unsafe { NVIC::unmask(Interrupt::ADC1_2) };
+        } else {
+            pac::ADC1.ier().modify(|w| w.set_awd2ie(true));
+        }
+    }
+}
+
+/// Analog-watchdog interrupt: an AWD1 (VCC) or AWD2 (temperature) trip is a hard
+/// fault, so report it with the reading in physical units and panic.
+#[interrupt]
+fn ADC1_2() {
+    let isr = pac::ADC1.isr().read();
+    // Re-read the freshest injected results so the reported value is the one that
+    // tripped the watchdog, not a stale cached estimate. JDR0 = VREFINT, JDR1 = temp.
+    let vdda_mv = live_vdda_mv();
+
+    if isr.awd1() {
         defmt::panic!(
-            "Analog sensor {=str} out of range: {=i32} {=str} not within [{=i32}, {=i32}]",
-            name,
-            value,
-            unit,
-            min,
-            max,
+            "VCC analog watchdog tripped: {=u32} mV not within [{=u32}, {=u32}] mV",
+            vdda_mv,
+            VCC_MIN_MV.load(Ordering::Relaxed),
+            VCC_MAX_MV.load(Ordering::Relaxed),
+        );
+    }
+
+    if isr.awd2() {
+        let temp_c = temperature_c(pac::ADC1.jdr(1).read().jdata(), vdda_mv);
+        defmt::panic!(
+            "Temperature analog watchdog tripped: {=i32} C not within [{=i32}, {=i32}] C",
+            temp_c,
+            TEMP_MIN_C.load(Ordering::Relaxed),
+            TEMP_MAX_C.load(Ordering::Relaxed),
         );
     }
 }
