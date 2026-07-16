@@ -1,5 +1,5 @@
 [target.'cfg(all(target_arch = "arm", target_os = "none"))']
-runner = "probe-rs run --chip STM32G474RB --connect-under-reset --protocol swd --speed 1000"
+runner = "probe-rs run --chip STM32U585AI --connect-under-reset --protocol swd --speed 1000"
 
 
 [env]

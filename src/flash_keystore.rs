@@ -10,12 +10,13 @@ use crate::noise_link::KeyStore;
 const MAGIC: u8 = 0xA5;
 
 const _: () = assert!(
-    WRITE_SIZE == 8,
-    "KeystoreRecord assumes 8-byte flash write granularity"
+    WRITE_SIZE == 16,
+    "KeystoreRecord assumes 16-byte flash write granularity"
 );
 
-/// On-flash layout of the persisted peer key. STM32G474 requires 8 byte alignment.
-#[repr(C, align(8))]
+/// On-flash layout of the persisted peer key. STM32U585 requires 16-byte
+/// (quad-word) aligned flash writes.
+#[repr(C, align(16))]
 struct KeystoreRecord {
     /// Validity marker (see [`MAGIC`]), padded to the flash write
     /// granularity so it can be written independently of `key`.
@@ -28,12 +29,12 @@ const _: () = assert!(
     "KeystoreRecord does not fit within a single erase page"
 );
 
-// Check embassy flash config: The stm32g474 has 4K erase pages only in
-// single-bank mode; the dual-bank config has 2K pages. This code and the linker
-// script curerntly assume single-bank config.
+// The STM32U585 has a fixed 8K flash erase page (in both single- and dual-bank
+// option-byte configs). The linker script (keystore.x) reserves one page of
+// this size at the top of flash; keep the two in sync.
 const _: () = assert!(
-    MAX_ERASE_SIZE == 4096,
-    "firmware requires embassy single-bank flash config on STM32G474"
+    MAX_ERASE_SIZE == 8192,
+    "firmware requires an 8K flash erase page (STM32U585)"
 );
 
 /// The reserved flash page for [`FlashKeyStore`] (see `keystore.x`), placed

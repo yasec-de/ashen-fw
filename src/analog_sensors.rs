@@ -26,11 +26,11 @@
 //! * **AWD2** watches the injected temperature channel. Its thresholds depend on
 //!   the live VDDA, so [`run_calibration`] recomputes them periodically.
 //!
-//! When either watchdog trips, the `ADC1_2` interrupt fires and the handler
+//! When either watchdog trips, the `ADC1` interrupt fires and the handler
 //! **panics** with the offending channel and its reading converted to a physical
 //! unit (routed out over the secure link by [`crate::panic_link`]).
 //!
-//! embassy-stm32 has no analog-watchdog or `JAUTO` API for the G4, so the
+//! embassy-stm32 has no analog-watchdog or `JAUTO` API for the U5, so the
 //! injected group and both watchdogs are configured through `embassy_stm32::pac`
 //! (the `unstable-pac` feature is enabled).
 //!
@@ -38,7 +38,7 @@
 //!
 //! ```ignore
 //! bind_interrupts!(struct Irqs {
-//!     DMA1_CH1 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA1_CH1>;
+//!     GPDMA1_CH0 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::GPDMA1_CH0>;
 //! });
 //!
 //! // DMA buffer length must be 2 * (1 + N_external) * K; the monitor's read
@@ -49,7 +49,7 @@
 //! const DMA_LEN: usize = HALF * 2;
 //! static DMA_BUF: StaticCell<[u16; DMA_LEN]> = StaticCell::new();
 //!
-//! let externals = [(p.PA0.degrade_adc(), SampleTime::CYCLES247_5)];
+//! let externals = [(p.PA0.degrade_adc(), SampleTime::CYCLES160_5)];
 //! let limits = [ExternalLimit { name: "vbat_div", min_mv: 0, max_mv: 1800 }];
 //! let cfg = WatchdogConfig {
 //!     vcc_min_mv: 3000, vcc_max_mv: 3600,
@@ -79,7 +79,7 @@ use embassy_stm32::dma::InterruptHandler as DmaInterruptHandler;
 use embassy_stm32::interrupt::typelevel::Binding;
 use embassy_stm32::pac;
 use embassy_stm32::pac::Interrupt;
-use embassy_stm32::pac::adc::vals::{Awd1sgl, Exten};
+use embassy_stm32::pac::adc::vals::Exten;
 use embassy_stm32::pac::interrupt;
 use embassy_stm32::peripherals::ADC1;
 use embassy_time::{Duration, Timer};
@@ -89,25 +89,50 @@ const ADC_RESOLUTION: Resolution = Resolution::BITS12;
 /// Full-scale count for [`ADC_RESOLUTION`] (`2**12 - 1`).
 const ADC_MAX_COUNT: u32 = 4095;
 
-/// ADC channel numbers on ADC1 (STM32G4).
-const VREFINT_CH: u8 = 18;
-const TEMPERATURE_CH: u8 = 16;
+/// ADC channel numbers on ADC1 (STM32U5).
+const VREFINT_CH: u8 = 0;
+const TEMPERATURE_CH: u8 = 19;
 
 /// Sample time for the slow internal channels (VREFINT, temperature), which both
-/// have long minimum sampling times. The longest setting keeps them valid across
-/// ADC-clock configurations at negligible cost.
-const INTERNAL_SAMPLE_TIME: SampleTime = SampleTime::CYCLES640_5;
+/// have long minimum sampling times. The longest setting the U5 main ADC offers
+/// (160.5 cycles) keeps them valid across ADC-clock configurations.
+const INTERNAL_SAMPLE_TIME: SampleTime = SampleTime::CYCLES160_5;
 
 /// Default interval between automatic VDDA recalibrations / AWD2 threshold updates.
 pub const DEFAULT_CALIBRATION_INTERVAL: Duration = Duration::from_secs(10);
 
-// Factory temperature-sensor calibration for the STM32G4 family: right-aligned
-// 12-bit raw counts captured at VDDA = `VREF_CALIB_MV`, at 30 °C and 130 °C
-// (RM0440 / DS12288). stm32-metapac maps `VREFINTCAL` but not these.
-const TS_CAL1_ADDR: *const u16 = 0x1FFF_75A8 as *const u16;
-const TS_CAL2_ADDR: *const u16 = 0x1FFF_75CA as *const u16;
+// Factory calibration values for the STM32U585, in the packaging/UID flash
+// region based at 0x0BFA_0700 (RM0456 / DS13086). stm32-metapac maps neither the
+// VREFINT nor the temperature-sensor calibration for the U5, so both are read
+// from their documented addresses here.
+//
+// ponytail: hard-coded DS addresses; if a future part in this family relocates
+// the cal block, these three consts are the one place to update.
+const VREFINTCAL_ADDR: *const u16 = 0x0BFA_07A5 as *const u16;
+// Temperature-sensor cal: raw 12-bit counts captured at VDDA = 3.0 V, at 30 °C
+// and 130 °C.
+const TS_CAL1_ADDR: *const u16 = 0x0BFA_0710 as *const u16;
+const TS_CAL2_ADDR: *const u16 = 0x0BFA_0742 as *const u16;
 const TS_CAL1_TEMP_C: i32 = 30;
 const TS_CAL2_TEMP_C: i32 = 130;
+/// VDDA at which the temperature sensor was factory-calibrated (U5: 3.0 V).
+const TS_CAL_VDDA_MV: i32 = 3000;
+
+/// Reads the factory VREFINT calibration count (captured at VDDA = `VREF_CALIB_MV`).
+fn vrefint_cal() -> u32 {
+    unsafe { read_volatile(VREFINTCAL_ADDR) as u32 }
+}
+
+/// Sets an ADC1 channel's sample time. The U5 main ADC splits the sample-time
+/// bits across SMPR1 (channels 0..=9) and SMPR2 (channels 10..=19).
+fn set_channel_sample_time(ch: u8, t: SampleTime) {
+    let ch = ch as usize;
+    if ch < 10 {
+        pac::ADC1.smpr(0).modify(|w| w.set_smp(ch, t));
+    } else {
+        pac::ADC1.smpr(1).modify(|w| w.set_smp(ch - 10, t));
+    }
+}
 
 // Configured limits, stored once by [`init`] so the interrupt handler can name
 // the window it crossed.
@@ -147,7 +172,7 @@ fn vdda_from_vrefint(vrefint_raw: u16) -> u32 {
     if vrefint_raw == 0 {
         return 0;
     }
-    let cal = pac::VREFINTCAL.data().read() as u32;
+    let cal = vrefint_cal();
     VREF_CALIB_MV * cal / vrefint_raw as u32
 }
 
@@ -167,30 +192,31 @@ fn raw_to_mv(raw: u16, vdda_mv: u32) -> u32 {
 fn temperature_c(raw: u16, vdda_mv: u32) -> i32 {
     let cal1 = unsafe { read_volatile(TS_CAL1_ADDR) } as i32;
     let cal2 = unsafe { read_volatile(TS_CAL2_ADDR) } as i32;
-    let ts = raw as i32 * vdda_mv as i32 / VREF_CALIB_MV as i32;
+    let ts = raw as i32 * vdda_mv as i32 / TS_CAL_VDDA_MV;
     (TS_CAL2_TEMP_C - TS_CAL1_TEMP_C) * (ts - cal1) / (cal2 - cal1) + TS_CAL1_TEMP_C
 }
 
 /// Fixed AWD1 thresholds (VREFINT counts) for a VCC window. Higher VCC produces a
 /// *lower* VREFINT count, so the bounds invert.
 fn awd1_thresholds(vcc_min_mv: u32, vcc_max_mv: u32) -> (u16, u16) {
-    let cal = pac::VREFINTCAL.data().read() as u32;
+    let cal = vrefint_cal();
     let lt1 = (VREF_CALIB_MV * cal / vcc_max_mv) as u16;
     let ht1 = (VREF_CALIB_MV * cal / vcc_min_mv) as u16;
     (lt1, ht1)
 }
 
-/// AWD2 thresholds (8-bit, upper bits of the 12-bit result) for a temperature
-/// window at the given live VDDA.
-fn awd2_thresholds(temp_min_c: i32, temp_max_c: i32, vdda_mv: u32) -> (u8, u8) {
+/// AWD2 thresholds (full-width ADC counts) for a temperature window at the given
+/// live VDDA. Unlike the G4, the U5 main-ADC watchdog thresholds (LTR2/HTR2) are
+/// full-resolution, so no truncation to the upper 8 bits is needed.
+fn awd2_thresholds(temp_min_c: i32, temp_max_c: i32, vdda_mv: u32) -> (u16, u16) {
     let cal1 = unsafe { read_volatile(TS_CAL1_ADDR) } as i32;
     let cal2 = unsafe { read_volatile(TS_CAL2_ADDR) } as i32;
     let raw = |t: i32| -> i32 {
         let ts = (t - TS_CAL1_TEMP_C) * (cal2 - cal1) / (TS_CAL2_TEMP_C - TS_CAL1_TEMP_C) + cal1;
-        (ts * VREF_CALIB_MV as i32 / vdda_mv as i32).clamp(0, ADC_MAX_COUNT as i32)
+        (ts * TS_CAL_VDDA_MV / vdda_mv as i32).clamp(0, ADC_MAX_COUNT as i32)
     };
-    let lt2 = (raw(temp_min_c) >> 4) as u8;
-    let ht2 = (raw(temp_max_c) >> 4) as u8;
+    let lt2 = raw(temp_min_c) as u16;
+    let ht2 = raw(temp_max_c) as u16;
     (lt2, ht2)
 }
 
@@ -281,10 +307,8 @@ where
     // Injected group: VREFINT (JDR0) then temperature (JDR1), auto-triggered
     // after each regular sequence. VREFINT is injected as well as regular so the
     // watchdog ISR can re-read a fresh supply estimate from a register.
-    pac::ADC1.smpr2().modify(|w| {
-        w.set_smp((VREFINT_CH - 10) as usize, INTERNAL_SAMPLE_TIME);
-        w.set_smp((TEMPERATURE_CH - 10) as usize, INTERNAL_SAMPLE_TIME);
-    });
+    set_channel_sample_time(VREFINT_CH, INTERNAL_SAMPLE_TIME);
+    set_channel_sample_time(TEMPERATURE_CH, INTERNAL_SAMPLE_TIME);
     pac::ADC1.jsqr().modify(|w| {
         w.set_jl(1); // two injected conversions
         w.set_jsq(0, VREFINT_CH);
@@ -296,24 +320,24 @@ where
         w.set_jdiscen(false);
         // AWD1: filtered, single regular channel = VREFINT.
         w.set_awd1en(true);
-        w.set_awd1sgl(Awd1sgl::SINGLE);
+        w.set_awd1sgl(true);
         w.set_awd1ch(VREFINT_CH);
     });
 
     let (lt1, ht1) = awd1_thresholds(cfg.vcc_min_mv, cfg.vcc_max_mv);
-    pac::ADC1.tr1().modify(|w| {
-        w.set_lt1(lt1);
-        w.set_ht1(ht1);
-        w.set_awdfilt(cfg.awd1_filter);
+    // On the U5, AWD1's thresholds and its input filter live in the LTR1/HTR1
+    // registers (AWDFILT1 in HTR1[31:29]), not a combined TR1 as on the G4.
+    pac::ADC1.ltr1().modify(|w| w.set_ltr1(lt1 as u32));
+    pac::ADC1.htr1().modify(|w| {
+        w.set_htr1(ht1 as u32);
+        w.set_awdfilt1(cfg.awd1_filter);
     });
 
     // AWD2: temperature channel, provisional wide window until the first
     // calibration writes real thresholds.
-    pac::ADC1.awd2cr().modify(|w| w.set_awd2ch(1 << TEMPERATURE_CH));
-    pac::ADC1.tr2().modify(|w| {
-        w.set_lt2(0);
-        w.set_ht2(0xFF);
-    });
+    pac::ADC1.awd2cr().modify(|w| w.set_awd2ch(TEMPERATURE_CH as usize, true));
+    pac::ADC1.ltr2().modify(|w| w.set_ltr2(0));
+    pac::ADC1.htr2().modify(|w| w.set_htr2(ADC_MAX_COUNT));
 
     // Keep watchdog interrupts masked until the first calibration.
     pac::ADC1.ier().modify(|w| {
@@ -389,10 +413,8 @@ pub async fn run_calibration(interval: Duration) -> ! {
         // Update thresholds with the AWD2 interrupt masked to avoid a spurious
         // trip from a transient mismatch during the write.
         pac::ADC1.ier().modify(|w| w.set_awd2ie(false));
-        pac::ADC1.tr2().modify(|w| {
-            w.set_lt2(lt2);
-            w.set_ht2(ht2);
-        });
+        pac::ADC1.ltr2().modify(|w| w.set_ltr2(lt2 as u32));
+        pac::ADC1.htr2().modify(|w| w.set_htr2(ht2 as u32));
         pac::ADC1.isr().write(|w| w.set_awd2(true)); // clear any pending flag
 
         if !pac::ADC1.ier().read().awd1ie() {
@@ -405,7 +427,7 @@ pub async fn run_calibration(interval: Duration) -> ! {
                 w.set_awd1ie(true);
                 w.set_awd2ie(true);
             });
-            unsafe { NVIC::unmask(Interrupt::ADC1_2) };
+            unsafe { NVIC::unmask(Interrupt::ADC1) };
         } else {
             pac::ADC1.ier().modify(|w| w.set_awd2ie(true));
         }
@@ -415,7 +437,7 @@ pub async fn run_calibration(interval: Duration) -> ! {
 /// Analog-watchdog interrupt: an AWD1 (VCC) or AWD2 (temperature) trip is a hard
 /// fault, so report it with the reading in physical units and panic.
 #[interrupt]
-fn ADC1_2() {
+fn ADC1() {
     let isr = pac::ADC1.isr().read();
     // Re-read the freshest injected results so the reported value is the one that
     // tripped the watchdog, not a stale cached estimate. JDR0 = VREFINT, JDR1 = temp.

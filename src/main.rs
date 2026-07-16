@@ -13,7 +13,7 @@ use embassy_executor::Spawner;
 use embassy_stm32::bind_interrupts;
 use embassy_stm32::flash::Flash;
 use embassy_stm32::gpio::{Level, Output, Speed};
-use embassy_stm32::peripherals::{RNG, USART1};
+use embassy_stm32::peripherals::{LPUART1, RNG};
 use embassy_stm32::rng::Rng;
 use embassy_stm32::usart::{BufferedUart, Config as UsartConfig};
 use embassy_time::Timer;
@@ -33,15 +33,19 @@ use ashen_fw::panic_link as _;
 #[global_allocator]
 static ALLOCATOR: emballoc::Allocator<4096> = emballoc::Allocator::new();
 
+// LPUART1 (PG7 TX / PG8 RX) is the internal serial link to the UNO Q's QRB2210
+// SoC — the port the SoC-side `arduino-router` (/dev/ttyHS1) talks to. USART1 on
+// this board is instead broken out to the Arduino R3 header (D0/D1), so it is
+// *not* the host link. See the Zephyr board devicetree for arduino_uno_q.
 bind_interrupts!(struct Irqs {
-    USART1 => embassy_stm32::usart::BufferedInterruptHandler<USART1>;
+    LPUART1 => embassy_stm32::usart::BufferedInterruptHandler<LPUART1>;
     RNG => embassy_stm32::rng::InterruptHandler<RNG>;
 });
 
-/// Size of the USART1 TX/RX ring buffers.
+/// Size of the LPUART1 TX/RX ring buffers.
 const UART_BUF_LEN: usize = 256;
 
-/// Blinks the status LED on PA5, independently of the host link.
+/// Blinks a status LED, independently of the host link.
 #[embassy_executor::task]
 async fn blink(mut led: Output<'static>) {
     loop {
@@ -62,8 +66,10 @@ fn boxed_hw_rng() -> Box<dyn Random> {
 async fn main(spawner: Spawner) {
     let p = embassy_stm32::init(Default::default());
 
+    // Status LED: the UNO Q's user RGB LEDs sit on port H and are active-low, so
+    // start High (off). PH10 is LED3's red channel per the Zephyr board dts.
     spawner.spawn(
-        blink(Output::new(p.PA5, Level::Low, Speed::Low)).expect("failed to spawn blink task"),
+        blink(Output::new(p.PH10, Level::High, Speed::Low)).expect("failed to spawn blink task"),
     );
 
     // Hand the RNG peripheral to `hw_rng`, which owns it for the rest of the
@@ -81,16 +87,17 @@ async fn main(spawner: Spawner) {
 
     static TX_BUF: StaticCell<[u8; UART_BUF_LEN]> = StaticCell::new();
     static RX_BUF: StaticCell<[u8; UART_BUF_LEN]> = StaticCell::new();
+    // LPUART1: rx = PG8, tx = PG7 (BufferedUart::new takes rx before tx).
     let uart = BufferedUart::new(
-        p.USART1,
-        p.PA10,
-        p.PA9,
+        p.LPUART1,
+        p.PG8,
+        p.PG7,
         TX_BUF.init([0; UART_BUF_LEN]),
         RX_BUF.init([0; UART_BUF_LEN]),
         Irqs,
         usart_config,
     )
-    .expect("USART1 init failed");
+    .expect("LPUART1 init failed");
 
     let handshake_rng = boxed_hw_rng();
     let link = NoiseLink::responder_handshake(uart, &local_keys.private, handshake_rng, &mut keystore)

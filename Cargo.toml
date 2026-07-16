@@ -35,7 +35,7 @@ micropb = { version = "0.6.0", default-features = false, features = ["alloc", "e
 # default dependency set so that `ashen_fw::noise_link` and its tests build
 # and run for the host architecture.
 [target.'cfg(target_os = "none")'.dependencies]
-embassy-stm32 = { version = "0.6.0", features = ["defmt", "stm32g474rb", "unstable-pac", "time-driver-any", "exti", "memory-x", "single-bank"]  }
+embassy-stm32 = { version = "0.6.0", features = ["defmt", "stm32u585ai", "unstable-pac", "time-driver-any", "exti", "memory-x"]  }
 embassy-sync = { version = "0.8.0", features = ["defmt"] }
 embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread", "defmt"] }
 embassy-time = { version = "0.5.1", features = ["defmt", "defmt-timestamp-uptime", "tick-hz-32_768"] }

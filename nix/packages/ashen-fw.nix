@@ -37,14 +37,14 @@ rustPlatform.buildRustPackage {
 
   buildPhase = ''
     runHook preBuild
-    cargo build --release --features embedded --target thumbv7em-none-eabihf
+    cargo build --release --features embedded --target thumbv8m.main-none-eabihf
     runHook postBuild
   '';
 
   installPhase = ''
     runHook preInstall
     mkdir -p $out/bin
-    cp target/thumbv7em-none-eabihf/release/${cargoToml.package.name} $out/bin/
+    cp target/thumbv8m.main-none-eabihf/release/${cargoToml.package.name} $out/bin/
     runHook postInstall
   '';
 
