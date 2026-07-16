@@ -37,6 +37,9 @@ pub enum Error {
     Io,
     /// Maximum buffer size exceeded during decoding
     Overflow,
+    /// A link reset (a run of at least `framing::RESET_NULL_RUN` `0x00` bytes)
+    /// was seen. Belongs to the frame I/O layer; never produced by `decode`.
+    Reset,
 }
 
 /// Pure model of [`decode`], used only for verification. Mirrors the executable

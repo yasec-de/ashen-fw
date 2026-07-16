@@ -6,7 +6,7 @@ use alloc::vec;
 
 use embedded_io_async::{Read, Write};
 
-use crate::framing;
+use crate::framing::{self, ResetReader};
 use crate::noise_link::{Error, KeyStore, NoiseLink, Random, builder};
 use crate::protocol::Message;
 
@@ -69,10 +69,16 @@ impl KeyStore for TestKeyStore {
 /// Initiator-side handshake code mirroring [`NoiseLink::responder_handshake`] for integration tests.
 impl<T: Read + Write> NoiseLink<T> {
     pub async fn initiator_handshake(
-        mut io: T,
+        io: T,
         local_static_key: &[u8],
         rng: Box<dyn Random>,
     ) -> Result<Self, Error> {
+        let mut io = ResetReader::new(io);
+
+        // Reset the responder (it ignores all data until reset once) and
+        // consume its null reply before starting the handshake.
+        io.send_reset().await?;
+
         let mut hs = builder(rng)?
             .local_private_key(local_static_key)?
             .build_initiator()?;

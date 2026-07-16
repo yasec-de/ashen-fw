@@ -22,7 +22,7 @@ use snow::types::{Cipher, Dh, Hash};
 pub use snow::types::Random;
 use snow::{Builder, TransportState};
 
-use crate::framing;
+use crate::framing::{self, ResetReader};
 
 /// Noise handshake pattern used for this link.
 pub const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
@@ -119,7 +119,7 @@ pub fn generate_keypair(rng: Box<dyn Random>) -> Result<snow::Keypair, Error> {
 }
 
 pub struct NoiseLink<T> {
-    pub(crate) io: T,
+    pub(crate) io: ResetReader<T>,
     pub(crate) transport: TransportState,
     pub(crate) peer_trusted: bool,
 }
@@ -128,30 +128,68 @@ impl<T: Read + Write> NoiseLink<T> {
     /// Performs the responder side of a Noise_XX handshake (`<- e, ee, s,
     /// es` then `-> s, se`), verifying the initiator's static key against
     /// `keystore` via TOFU.
+    /// Performs [`responder_handshake`](Self::responder_handshake), retrying
+    /// on any error (including a link reset mid-handshake) with a fresh RNG
+    /// each attempt. Because a reset is the normal way a peer (re)connects,
+    /// this never gives up: it keeps the `ResetReader` (and its post-reset
+    /// armed state) and re-runs the handshake until one completes.
+    pub async fn responder_handshake_retry<K: KeyStore, F>(
+        mut io: ResetReader<T>,
+        local_static_key: &[u8],
+        mut fresh_rng: F,
+        keystore: &mut K,
+    ) -> Self
+    where
+        F: FnMut() -> Box<dyn Random>,
+    {
+        loop {
+            match Self::responder_handshake(io, local_static_key, fresh_rng(), keystore).await {
+                Ok(link) => return link,
+                Err((_e, returned_io)) => {
+                    #[cfg(target_os = "none")]
+                    defmt::warn!("Handshake failed, retrying");
+                    io = returned_io;
+                }
+            }
+        }
+    }
+
     pub async fn responder_handshake<K: KeyStore>(
-        mut io: T,
+        mut io: ResetReader<T>,
         local_static_key: &[u8],
         rng: Box<dyn Random>,
         keystore: &mut K,
-    ) -> Result<Self, Error> {
-        let mut hs = builder(rng)?
-            .local_private_key(local_static_key)?
-            .build_responder()?;
+    ) -> Result<Self, (Error, ResetReader<T>)> {
+        macro_rules! tri {
+            ($e:expr) => {
+                match $e {
+                    Ok(v) => v,
+                    Err(e) => return Err((Error::from(e), io)),
+                }
+            };
+        }
+
+        let mut hs = tri!((|| {
+            builder(rng)?
+                .local_private_key(local_static_key)?
+                .build_responder()
+                .map_err(Error::from)
+        })());
 
         let mut buf = vec![0u8; framing::MAX_PAYLOAD_LEN];
 
         // -> e
-        let msg = framing::read_frame(&mut io).await?;
-        hs.read_message(&msg, &mut buf)?;
+        let msg = tri!(framing::read_frame(&mut io).await);
+        tri!(hs.read_message(&msg, &mut buf));
 
         // <- e, ee, s, es
-        let len = hs.write_message(&[], &mut buf)?;
-        framing::write_frame(&mut io, &buf[..len]).await?;
+        let len = tri!(hs.write_message(&[], &mut buf));
+        tri!(framing::write_frame(&mut io, &buf[..len]).await);
 
         // -> s, se
-        let msg = framing::read_frame(&mut io).await?;
-        hs.read_message(&msg, &mut buf)?;
-        let transport = hs.into_transport_mode()?;
+        let msg = tri!(framing::read_frame(&mut io).await);
+        tri!(hs.read_message(&msg, &mut buf));
+        let transport = tri!(hs.into_transport_mode());
 
         let remote_static = transport
             .get_remote_static()
@@ -189,8 +227,9 @@ impl<T: Read + Write> NoiseLink<T> {
 
     /// Consumes the link, returning its underlying transport so a fresh
     /// handshake can be performed over the same I/O channel (see
-    /// [`NoiseLink::responder_handshake`]).
-    pub fn into_io(self) -> T {
+    /// [`NoiseLink::responder_handshake`]). The [`ResetReader`] state (its
+    /// null-run counter and armed flag) is preserved across handshakes.
+    pub fn into_io(self) -> ResetReader<T> {
         self.io
     }
 

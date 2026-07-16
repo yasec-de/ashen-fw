@@ -6,6 +6,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 
 use ashen_fw::flash_keystore::FlashKeyStore;
+use ashen_fw::framing::ResetReader;
 use ashen_fw::hw_rng::{self, HwRng};
 use ashen_fw::noise_link::{KeyStore, Random, NoiseLink, generate_keypair};
 use ashen_fw::protocol::SessionEnd;
@@ -99,10 +100,13 @@ async fn main(spawner: Spawner) {
     )
     .expect("LPUART1 init failed");
 
-    let handshake_rng = boxed_hw_rng();
-    let link = NoiseLink::responder_handshake(uart, &local_keys.private, handshake_rng, &mut keystore)
-        .await
-        .expect("handshake failed");
+    // Wrap the UART so the link-reset detector (a run of >=8 null bytes) and
+    // the "ignore all data until the first reset" startup rule persist across
+    // every handshake over this UART.
+    let io = ResetReader::new(uart);
+
+    let link = NoiseLink::responder_handshake_retry(io, &local_keys.private, boxed_hw_rng, &mut keystore)
+        .await;
 
     // The link lives in an `Option` slot so that, between sessions, it can
     // be taken out (recovering the underlying UART) and replaced with a
@@ -137,11 +141,9 @@ async fn main(spawner: Spawner) {
         // peer is expected to reconnect. The slot is briefly empty while the
         // handshake runs (see `panic_link`'s `Option` impl).
         let io = link.take().expect("link present").into_io();
-        let rng = boxed_hw_rng();
         *link = Some(
-            NoiseLink::responder_handshake(io, &local_keys.private, rng, &mut keystore)
-                .await
-                .expect("handshake failed"),
+            NoiseLink::responder_handshake_retry(io, &local_keys.private, boxed_hw_rng, &mut keystore)
+                .await,
         );
     }
 }

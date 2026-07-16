@@ -7,6 +7,7 @@
 
 use std::thread;
 
+use ashen_fw::framing::ResetReader;
 use ashen_fw::noise_link::{KeyStore, NoiseLink, generate_keypair};
 use ashen_fw::test_util::TestKeyStore;
 use ashen_fw::protocol::{Message, SessionEnd};
@@ -27,9 +28,8 @@ fn handshake_and_echo_round_trips() {
         embassy_futures::block_on(async move {
             let mut keystore = TestKeyStore::default();
             let mut link =
-                NoiseLink::responder_handshake(server_io, &server_static, rng(0x00C0_FFEE), &mut keystore)
-                    .await
-                    .expect("server handshake failed");
+                NoiseLink::responder_handshake_retry(ResetReader::new(server_io), &server_static, || rng(0x00C0_FFEE), &mut keystore)
+                    .await;
 
             // Explicit pairing: a bare handshake neither records nor trusts
             // the peer's static key. The server still learns it (so it can be
@@ -118,14 +118,13 @@ fn handshake_rejects_mismatched_remote_static_key() {
         });
 
         embassy_futures::block_on(async {
-            let mut link = NoiseLink::responder_handshake(
-                server_io,
+            let mut link = NoiseLink::responder_handshake_retry(
+                ResetReader::new(server_io),
                 &server_static,
-                rng(0x00C0_FFEE),
+                || rng(0x00C0_FFEE),
                 &mut server_keystore,
             )
-            .await
-            .expect("server handshake with client A failed");
+            .await;
 
             // A bare handshake does not trust the peer; pairing does.
             assert!(!link.is_peer_trusted(), "peer must not be trusted before pairing");
@@ -160,14 +159,13 @@ fn handshake_rejects_mismatched_remote_static_key() {
         });
 
         embassy_futures::block_on(async {
-            let link = NoiseLink::responder_handshake(
-                server_io,
+            let link = NoiseLink::responder_handshake_retry(
+                ResetReader::new(server_io),
                 &server_static,
-                rng(0x1357_9BDF),
+                || rng(0x1357_9BDF),
                 &mut server_keystore,
             )
-            .await
-            .expect("server handshake with client B failed");
+            .await;
 
             if link.is_peer_trusted() {
                 panic!("Peer trusted despite incorrect key");
@@ -193,9 +191,8 @@ fn run_session_returns_error_on_disconnect() {
         embassy_futures::block_on(async move {
             let mut keystore = TestKeyStore::default();
             let mut link =
-                NoiseLink::responder_handshake(server_io, &server_static, rng(0xAAAA_AAAA), &mut keystore)
-                    .await
-                    .expect("server handshake failed");
+                NoiseLink::responder_handshake_retry(ResetReader::new(server_io), &server_static, || rng(0xAAAA_AAAA), &mut keystore)
+                    .await;
 
             // The client sends one echo request, then drops its end of the
             // transport; the server's next read fails with an Io error.
