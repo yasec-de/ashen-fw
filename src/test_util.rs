@@ -8,7 +8,7 @@ use embedded_io_async::{Read, Write};
 
 use crate::framing;
 use crate::noise_link::{Error, KeyStore, NoiseLink, Random, builder};
-use crate::protocol::{Disconnect, Envelope, Erase, Msg, PairRequest};
+use crate::protocol::Message;
 
 /// PRNG for providing deterministic randomness during tests
 #[derive(Clone)]
@@ -100,29 +100,20 @@ impl<T: Read + Write> NoiseLink<T> {
         Ok(link)
     }
 
-    /// Sends a [`Disconnect`], telling the peer to end the session.
+    /// Sends a [`Message::Disconnect`], telling the peer to end the session.
     pub async fn send_disconnect(&mut self) -> Result<(), Error> {
-        self.send_envelope(&Envelope {
-            r#msg: Some(Msg::Disconnect(Disconnect::default())),
-        })
-        .await
+        self.send_msg(&Message::Disconnect).await
     }
 
-    /// Sends an [`Erase`], telling the peer to end the session, erase its
-    /// TOFU keystore, and regenerate its static identity key.
+    /// Sends a [`Message::Erase`], telling the peer to end the session, erase
+    /// its TOFU keystore, and regenerate its static identity key.
     pub async fn send_erase(&mut self) -> Result<(), Error> {
-        self.send_envelope(&Envelope {
-            r#msg: Some(Msg::Erase(Erase::default())),
-        })
-        .await
+        self.send_msg(&Message::Erase).await
     }
 
-    /// Sends a [`PairRequest`], asking the peer to commit our static key to
-    /// its keystore (only succeeds while the peer is erased/unkeyed).
+    /// Sends a [`Message::PairRequest`], asking the peer to commit our static
+    /// key to its keystore (only succeeds while the peer is erased/unkeyed).
     pub async fn send_pair_request(&mut self) -> Result<(), Error> {
-        self.send_envelope(&Envelope {
-            r#msg: Some(Msg::PairRequest(PairRequest::default())),
-        })
-        .await
+        self.send_msg(&Message::PairRequest).await
     }
 }

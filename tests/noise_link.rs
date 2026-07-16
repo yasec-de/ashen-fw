@@ -9,7 +9,7 @@ use std::thread;
 
 use ashen_fw::noise_link::{KeyStore, NoiseLink, generate_keypair};
 use ashen_fw::test_util::TestKeyStore;
-use ashen_fw::protocol::{EchoRequest, Envelope, Msg, SessionEnd};
+use ashen_fw::protocol::{Message, SessionEnd};
 
 mod common;
 use common::{duplex_pair, rng};
@@ -62,17 +62,13 @@ fn handshake_and_echo_round_trips() {
         // Three echo round trips.
         for value in [41, 99, 1000] {
             client
-                .send_envelope(&Envelope {
-                    r#msg: Some(Msg::EchoRequest(EchoRequest { r#value: value })),
-                })
+                .send_msg(&Message::EchoRequest { value })
                 .await
                 .expect("send echo request failed");
 
-            let response = client.receive_envelope().await.expect("receive echo response");
+            let response = client.receive_msg().await.expect("receive echo response");
             match response {
-                Envelope {
-                    r#msg: Some(Msg::EchoResponse(echo)),
-                } => assert_eq!(echo.r#value, value + 1),
+                Message::EchoResponse { value: got } => assert_eq!(got, value + 1),
                 other => panic!("expected echo response, got {other:?}"),
             }
         }
@@ -109,11 +105,11 @@ fn handshake_rejects_mismatched_remote_static_key() {
                 .expect("client A handshake failed");
 
                 client.send_pair_request().await.expect("pair request failed");
-                let response = client.receive_envelope().await.expect("receive pair response");
+                let response = client.receive_msg().await.expect("receive pair response");
                 match response {
-                    Envelope {
-                        r#msg: Some(Msg::PairResponse(pair)),
-                    } => assert!(pair.r#success, "pairing should succeed on an unkeyed device"),
+                    Message::PairResponse { success } => {
+                        assert!(success, "pairing should succeed on an unkeyed device")
+                    }
                     other => panic!("expected pair response, got {other:?}"),
                 }
 
@@ -221,17 +217,13 @@ fn run_session_returns_error_on_disconnect() {
         .expect("client handshake failed");
 
         client
-            .send_envelope(&Envelope {
-                r#msg: Some(Msg::EchoRequest(EchoRequest { r#value: 41 })),
-            })
+            .send_msg(&Message::EchoRequest { value: 41 })
             .await
             .expect("send echo request failed");
 
-        let response = client.receive_envelope().await.expect("receive echo response");
+        let response = client.receive_msg().await.expect("receive echo response");
         match response {
-            Envelope {
-                r#msg: Some(Msg::EchoResponse(echo)),
-            } => assert_eq!(echo.r#value, 42),
+            Message::EchoResponse { value } => assert_eq!(value, 42),
             other => panic!("expected echo response, got {other:?}"),
         }
 

@@ -1,10 +1,10 @@
-//! Host-side tests for the protobuf protocol in [`ashen_fw::protocol`].
+//! Host-side tests for the byte protocol in [`ashen_fw::protocol`].
 
 use std::thread;
 
 use ashen_fw::noise_link::{KeyStore, NoiseLink, generate_keypair};
 use ashen_fw::test_util::TestKeyStore;
-use ashen_fw::protocol::{EchoRequest, Envelope, Msg, SessionEnd};
+use ashen_fw::protocol::{Message, SessionEnd};
 
 mod common;
 use common::{duplex_pair, rng};
@@ -43,17 +43,13 @@ fn echo_request_replies_with_value_plus_one() {
         .expect("client handshake failed");
 
         client
-            .send_envelope(&Envelope {
-                r#msg: Some(Msg::EchoRequest(EchoRequest { r#value: 41 })),
-            })
+            .send_msg(&Message::EchoRequest { value: 41 })
             .await
             .expect("send echo request failed");
 
-        let response = client.receive_envelope().await.expect("receive echo response");
+        let response = client.receive_msg().await.expect("receive echo response");
         match response {
-            Envelope {
-                r#msg: Some(Msg::EchoResponse(echo)),
-            } => assert_eq!(echo.r#value, 42),
+            Message::EchoResponse { value } => assert_eq!(value, 42),
             other => panic!("expected echo response, got {other:?}"),
         }
 
@@ -100,12 +96,10 @@ fn send_log_message_round_trips() {
         .await
         .expect("client handshake failed");
 
-        let response = client.receive_envelope().await.expect("receive log message");
+        let response = client.receive_msg().await.expect("receive log message");
         match response {
-            Envelope {
-                r#msg: Some(Msg::Log(log)),
-            } => {
-                assert_eq!(log.r#data, b"defmt frame bytes");
+            Message::Log(data) => {
+                assert_eq!(data, b"defmt frame bytes");
             }
             other => panic!("expected log message, got {other:?}"),
         }
@@ -116,9 +110,10 @@ fn send_log_message_round_trips() {
     server_thread.join().expect("server thread panicked");
 }
 
-/// An [`Erase`](ashen_fw::protocol::Erase) message ends the session like a
-/// [`Disconnect`], but the responder additionally has to erase its TOFU
-/// keystore (forgetting the previously-trusted remote static key).
+/// An [`Erase`](ashen_fw::protocol::Message::Erase) message ends the session
+/// like a [`Disconnect`](ashen_fw::protocol::Message::Disconnect), but the
+/// responder additionally has to erase its TOFU keystore (forgetting the
+/// previously-trusted remote static key).
 #[test]
 fn erase_request_ends_session_and_clears_keystore() {
     let server_keys = generate_keypair(rng(0x1234_5678)).unwrap();
@@ -203,9 +198,7 @@ fn echo_request_overflow_panics() {
         .expect("client handshake failed");
 
         client
-            .send_envelope(&Envelope {
-                r#msg: Some(Msg::EchoRequest(EchoRequest { r#value: u64::MAX })),
-            })
+            .send_msg(&Message::EchoRequest { value: u64::MAX })
             .await
             .expect("send echo request failed");
     });

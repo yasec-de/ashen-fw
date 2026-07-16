@@ -6,8 +6,8 @@
 //! [`register`] a [`NoiseLink`] once its handshake has completed; on panic,
 //! the handler logs the panic via `defmt` (queueing a frame in
 //! [`crate::defmt_link`]) and makes a best-effort attempt to flush that
-//! queue to the host as [`LogMessage`](crate::protocol::LogMessage)
-//! envelopes through it before halting. Flushing uses a fixed-size,
+//! queue to the host as [`Message::Log`](crate::protocol::Message)
+//! messages through it before halting. Flushing uses a fixed-size,
 //! non-allocating buffer so it cannot itself panic due to allocator failure;
 //! if it fails for any other reason (e.g. the transport is wedged, or the
 //! panic happened during a send/receive on the same link), the handler gives
@@ -28,7 +28,7 @@ pub trait PanicReport: Send {
     /// Flushes any `defmt` log frames queued by [`crate::defmt_link`]
     /// (including the panic message just logged by the
     /// `#[panic_handler]` in this module) to the host as
-    /// [`LogMessage`](crate::protocol::LogMessage) envelopes. Errors are
+    /// [`Message::Log`](crate::protocol::Message) messages. Errors are
     /// ignored: this is a best-effort report made from a
     /// `#[panic_handler]`, where there is nothing more to do if it fails.
     ///

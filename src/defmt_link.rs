@@ -6,8 +6,8 @@
 //!   keep working exactly as with [`defmt_rtt`](https://docs.rs/defmt-rtt).
 //! - A fixed-size, in-memory [`LOG_QUEUE`], drained by
 //!   [`NoiseLink::run_session`](crate::noise_link::NoiseLink::run_session)
-//!   and forwarded to the host as [`LogMessage`](crate::protocol::LogMessage)
-//!   envelopes whenever the link isn't otherwise busy.
+//!   and forwarded to the host as [`Message::Log`](crate::protocol::Message)
+//!   messages whenever the link isn't otherwise busy.
 //!
 //! Both sinks are best-effort and lossy: if the RTT host isn't connected, or
 //! the queue is full, data is silently dropped rather than blocking the
@@ -183,7 +183,7 @@ static _SEGGER_RTT: RttHeader = RttHeader {
 
 // ---------------------------------------------------------------------
 // Log queue: holds encoded defmt frames for `NoiseLink::run_session` to
-// forward to the host as `LogMessage` envelopes.
+// forward to the host as `Message::Log` messages.
 // ---------------------------------------------------------------------
 
 const LOG_QUEUE_CAPACITY: usize = 16;

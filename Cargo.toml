@@ -29,7 +29,6 @@ verus_builtin_macros = "=0.0.0-2026-06-14-0213"
 embassy-futures = { version = "0.1.2" }
 subtle = { version = "2", default-features = false }
 snow = { version = "0.10.0", default-features = false, features = ["default-resolver", "use-curve25519", "use-chacha20poly1305", "use-sha2"] }
-micropb = { version = "0.6.0", default-features = false, features = ["alloc", "encode", "decode", "enable-64bit"] }
 
 # Dependencies only used by the embedded firmware binary. Kept out of the
 # default dependency set so that `ashen_fw::noise_link` and its tests build
@@ -73,9 +72,6 @@ lto = true          # Enable link-time optimization
 codegen-units = 1   # Better optimization
 debug = true        # Keep debug info for defmt, but smaller than debug = 2
 strip = false       # Don't strip, we need symbols for debugging
-
-[build-dependencies]
-micropb-gen = "0.6.0"
 
 # The `verus!` macro in `src/cobs/codec.rs` expands to code annotated with
 # `cfg(verus_keep_ghost)` (set only when the `verus` verifier compiles the file,

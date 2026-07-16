@@ -1,36 +1,155 @@
-//! Protobuf-encoded messages exchanged between host and device over a
+//! Byte-oriented messages exchanged between host and device over a
 //! [`NoiseLink`](crate::noise_link::NoiseLink).
 //!
 //! Each [`NoiseLink::send`](crate::noise_link::NoiseLink::send)/
-//! [`receive`](crate::noise_link::NoiseLink::receive) call carries exactly
-//! one protobuf-encoded [`Envelope`]. Status updates and error reports are
-//! sent as `defmt`-encoded [`LogMessage`] frames (see
-//! [`crate::defmt_link`]); host-to-device commands and their responses will
-//! be added as additional `Envelope` fields.
+//! [`receive`](crate::noise_link::NoiseLink::receive) call carries exactly one
+//! message. The wire format is deliberately minimal: the first byte is the
+//! message type (see [`MsgType`]); any payload follows in a fixed, `#[packed]`
+//! layout. Multi-byte integers are big-endian. This mirrors the C definitions:
+//!
+//! ```c
+//! enum ashen_msg_type { ASHEN_MSG_NONE = 0, ASHEN_MSG_LOG = 1, ... };
+//! struct ashen_msg_log            { u8 type; u8 data[]; };
+//! struct ashen_msg_pair_response  { u8 type; u8 success; };
+//! struct ashen_msg_status_response{ u8 type; u8 peer_trusted; u8 is_keyed; };
+//! struct ashen_msg_echo           { u8 type; __be64 value; };
+//! ```
+//!
+//! Bare commands (`Erase`, `PairRequest`, `StatusRequest`, `Disconnect`) are a
+//! single type byte with no payload.
 
 use alloc::vec::Vec;
 
 use embassy_futures::select::{Either, select};
 use embedded_io_async::{Read, Write};
-use micropb::{MessageDecode, MessageEncode, PbEncoder};
 
 use crate::noise_link::{Error, KeyStore, NoiseLink};
 
-#[allow(nonstandard_style, unused, irrefutable_let_patterns, clippy::all)]
-mod device_pb {
-    include!(concat!(env!("OUT_DIR"), "/device.rs"));
-}
-
-pub use device_pb::ashen_;
-pub use device_pb::ashen_::{
-    Disconnect, EchoRequest, EchoResponse, Envelope, Envelope_::Msg, Erase, LogMessage,
-    PairRequest, PairResponse, StatusResponse,
-};
-
 /// Maximum size, in bytes, of a single encoded `defmt` log frame forwarded
-/// to the host as a [`LogMessage`]. Longer frames are dropped by
+/// to the host as a [`MsgType::Log`] message. Longer frames are dropped by
 /// [`crate::defmt_link`].
 pub const MAX_LOG_FRAME_LEN: usize = 128;
+
+/// Wire message type. The discriminant is the on-wire first byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MsgType {
+    None = 0,
+    Log = 1,
+    Erase = 2,
+    PairRequest = 3,
+    PairResponse = 4,
+    StatusRequest = 5,
+    StatusResponse = 6,
+    Disconnect = 7,
+    EchoRequest = 8,
+    EchoResponse = 9,
+}
+
+impl MsgType {
+    fn from_u8(b: u8) -> Option<Self> {
+        Some(match b {
+            1 => Self::Log,
+            2 => Self::Erase,
+            3 => Self::PairRequest,
+            4 => Self::PairResponse,
+            5 => Self::StatusRequest,
+            6 => Self::StatusResponse,
+            7 => Self::Disconnect,
+            8 => Self::EchoRequest,
+            9 => Self::EchoResponse,
+            _ => return None,
+        })
+    }
+}
+
+/// A decoded protocol message. Payload-carrying variants own their data; bare
+/// commands carry none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Message {
+    /// A single defmt-encoded log frame (`ASHEN_MSG_LOG`).
+    Log(Vec<u8>),
+    Erase,
+    PairRequest,
+    PairResponse { success: bool },
+    StatusRequest,
+    StatusResponse { peer_trusted: bool, is_keyed: bool },
+    Disconnect,
+    EchoRequest { value: u64 },
+    EchoResponse { value: u64 },
+}
+
+impl Message {
+    /// Serializes into the wire format described in the module docs.
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        match self {
+            Message::Log(data) => {
+                out.push(MsgType::Log as u8);
+                out.extend_from_slice(data);
+            }
+            Message::Erase => out.push(MsgType::Erase as u8),
+            Message::PairRequest => out.push(MsgType::PairRequest as u8),
+            Message::PairResponse { success } => {
+                out.push(MsgType::PairResponse as u8);
+                out.push(*success as u8);
+            }
+            Message::StatusRequest => out.push(MsgType::StatusRequest as u8),
+            Message::StatusResponse {
+                peer_trusted,
+                is_keyed,
+            } => {
+                out.push(MsgType::StatusResponse as u8);
+                out.push(*peer_trusted as u8);
+                out.push(*is_keyed as u8);
+            }
+            Message::Disconnect => out.push(MsgType::Disconnect as u8),
+            Message::EchoRequest { value } => {
+                out.push(MsgType::EchoRequest as u8);
+                out.extend_from_slice(&value.to_be_bytes());
+            }
+            Message::EchoResponse { value } => {
+                out.push(MsgType::EchoResponse as u8);
+                out.extend_from_slice(&value.to_be_bytes());
+            }
+        }
+        out
+    }
+
+    /// Parses a wire message. Returns [`Error::Protocol`] on an unknown type,
+    /// an unexpected `None`, or a payload that is too short for its type.
+    fn decode(bytes: &[u8]) -> Result<Self, Error> {
+        let (&type_byte, payload) = bytes.split_first().ok_or(Error::Protocol)?;
+        let ty = MsgType::from_u8(type_byte).ok_or(Error::Protocol)?;
+        Ok(match ty {
+            MsgType::None => return Err(Error::Protocol),
+            MsgType::Log => Message::Log(payload.into()),
+            MsgType::Erase => Message::Erase,
+            MsgType::PairRequest => Message::PairRequest,
+            MsgType::PairResponse => Message::PairResponse {
+                success: *payload.first().ok_or(Error::Protocol)? != 0,
+            },
+            MsgType::StatusRequest => Message::StatusRequest,
+            MsgType::StatusResponse => Message::StatusResponse {
+                peer_trusted: *payload.first().ok_or(Error::Protocol)? != 0,
+                is_keyed: *payload.get(1).ok_or(Error::Protocol)? != 0,
+            },
+            MsgType::Disconnect => Message::Disconnect,
+            MsgType::EchoRequest => Message::EchoRequest {
+                value: read_be64(payload)?,
+            },
+            MsgType::EchoResponse => Message::EchoResponse {
+                value: read_be64(payload)?,
+            },
+        })
+    }
+}
+
+/// Reads a big-endian u64 from the start of `payload`, erroring if short.
+fn read_be64(payload: &[u8]) -> Result<u64, Error> {
+    let bytes: [u8; 8] = payload.get(..8).ok_or(Error::Protocol)?.try_into().unwrap();
+    Ok(u64::from_be_bytes(bytes))
+}
 
 #[cfg(target_os = "none")]
 fn pop_log_frame(out: &mut [u8]) -> Option<usize> {
@@ -60,35 +179,24 @@ pub enum SessionEnd {
 }
 
 impl<T: Read + Write> NoiseLink<T> {
-    /// Encodes `envelope` as protobuf and sends it as a single transport
-    /// message.
-    pub async fn send_envelope(&mut self, envelope: &Envelope) -> Result<(), Error> {
-        let mut encoder = PbEncoder::new(Vec::new());
-        envelope.encode(&mut encoder).map_err(|_| Error::Protocol)?;
-        self.send(encoder.as_writer()).await
+    /// Encodes `msg` and sends it as a single transport message.
+    pub async fn send_msg(&mut self, msg: &Message) -> Result<(), Error> {
+        self.send(&msg.encode()).await
     }
 
-    /// Receives a single transport message and decodes it as protobuf.
-    pub async fn receive_envelope(&mut self) -> Result<Envelope, Error> {
+    /// Receives a single transport message and decodes it.
+    pub async fn receive_msg(&mut self) -> Result<Message, Error> {
         let payload = self.receive().await?;
-        let mut envelope = Envelope::default();
-        envelope
-            .decode_from_bytes(&payload)
-            .map_err(|_| Error::Protocol)?;
-        Ok(envelope)
+        Message::decode(&payload)
     }
 
-    /// Sends `data` (a single encoded `defmt` log frame) as a
-    /// [`LogMessage`].
+    /// Sends `data` (a single encoded `defmt` log frame) as a [`Message::Log`].
     pub async fn send_log_message(&mut self, data: &[u8]) -> Result<(), Error> {
-        self.send_envelope(&Envelope {
-            r#msg: Some(Msg::Log(LogMessage { r#data: data.into() })),
-        })
-        .await
+        self.send_msg(&Message::Log(data.into())).await
     }
 
     /// Sends any `defmt` log frames queued by [`crate::defmt_link`] as
-    /// [`LogMessage`] envelopes.
+    /// [`Message::Log`] messages.
     pub(crate) async fn flush_log_queue(&mut self) -> Result<(), Error> {
         let mut buf = [0u8; MAX_LOG_FRAME_LEN];
         while let Some(len) = pop_log_frame(&mut buf) {
@@ -97,63 +205,46 @@ impl<T: Read + Write> NoiseLink<T> {
         Ok(())
     }
 
-    async fn handle_envelope<K: KeyStore>(
+    async fn handle_message<K: KeyStore>(
         &mut self,
         keystore: &mut K,
-        envelope: Envelope,
+        msg: Message,
     ) -> Result<Option<SessionEnd>, Error> {
-        match envelope.r#msg {
-            Some(Msg::EchoRequest(request)) => {
-                let value = request
-                    .r#value
-                    .checked_add(1)
-                    .expect("EchoRequest overflow");
-                self.send_envelope(&Envelope {
-                    r#msg: Some(Msg::EchoResponse(EchoResponse { r#value: value })),
-                })
-                .await?;
+        match msg {
+            Message::EchoRequest { value } => {
+                let value = value.checked_add(1).expect("EchoRequest overflow");
+                self.send_msg(&Message::EchoResponse { value }).await?;
                 Ok(None)
             }
-            Some(Msg::Disconnect(_)) => {
-                // Courtesy acknowledgement (see the `Disconnect` proto doc).
-                // The peer that asked to disconnect may already have dropped
-                // the link, so a failed send here is not a session error: we
-                // are ending the session regardless.
-                let _ = self
-                    .send_envelope(&Envelope {
-                        r#msg: Some(Msg::Disconnect(Disconnect {})),
-                    })
-                    .await;
+            Message::Disconnect => {
+                // Courtesy acknowledgement. The peer that asked to disconnect
+                // may already have dropped the link, so a failed send here is
+                // not a session error: we are ending the session regardless.
+                let _ = self.send_msg(&Message::Disconnect).await;
                 Ok(Some(SessionEnd::Disconnected))
             }
-            Some(Msg::Erase(_)) => {
+            Message::Erase => {
                 // The caller erases the keystore and rotates the identity key
                 // upon seeing `SessionEnd::Erased` (see `crate::main`).
                 Ok(Some(SessionEnd::Erased))
             }
-            Some(Msg::PairRequest(_)) => {
+            Message::PairRequest => {
                 if keystore.trusted_key().is_some() {
                     #[cfg(target_os = "none")]
                     defmt::error!("Cannot pair while keyed, must be erased first");
-                    self.send_envelope(&Envelope {
-                        r#msg: Some(Msg::PairResponse(PairResponse { r#success: false })),
-                    })
-                    .await?;
+                    self.send_msg(&Message::PairResponse { success: false })
+                        .await?;
                 } else {
                     self.trust(keystore).expect("Bug!");
-                    self.send_envelope(&Envelope {
-                        r#msg: Some(Msg::PairResponse(PairResponse { r#success: true })),
-                    })
-                    .await?;
+                    self.send_msg(&Message::PairResponse { success: true })
+                        .await?;
                 }
                 Ok(None)
             }
-            Some(Msg::StatusRequest(_)) => {
-                self.send_envelope(&Envelope {
-                    r#msg: Some(Msg::StatusResponse(StatusResponse {
-                        r#peer_trusted: self.is_peer_trusted(),
-                        r#is_keyed: keystore.trusted_key().is_some(),
-                    })),
+            Message::StatusRequest => {
+                self.send_msg(&Message::StatusResponse {
+                    peer_trusted: self.is_peer_trusted(),
+                    is_keyed: keystore.trusted_key().is_some(),
                 })
                 .await?;
                 Ok(None)
@@ -172,10 +263,10 @@ impl<T: Read + Write> NoiseLink<T> {
                 return SessionEnd::Error(e);
             }
 
-            match select(self.receive_envelope(), wait_for_log_frame()).await {
+            match select(self.receive_msg(), wait_for_log_frame()).await {
                 Either::First(result) => {
                     let result = match result {
-                        Ok(envelope) => self.handle_envelope(keystore, envelope).await,
+                        Ok(msg) => self.handle_message(keystore, msg).await,
                         Err(e) => Err(e),
                     };
                     match result {
@@ -191,5 +282,42 @@ impl<T: Read + Write> NoiseLink<T> {
                 Either::Second(()) => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ponytail: one round-trip check that the byte layout is stable and every
+    // variant decodes back to itself.
+    #[test]
+    fn encode_decode_round_trips() {
+        let cases = [
+            Message::Log(b"frame".to_vec()),
+            Message::Erase,
+            Message::PairRequest,
+            Message::PairResponse { success: true },
+            Message::StatusRequest,
+            Message::StatusResponse { peer_trusted: true, is_keyed: false },
+            Message::Disconnect,
+            Message::EchoRequest { value: 0x0102_0304_0506_0708 },
+            Message::EchoResponse { value: u64::MAX },
+        ];
+        for msg in cases {
+            assert_eq!(Message::decode(&msg.encode()).unwrap(), msg);
+        }
+
+        // Big-endian on the wire: type byte then 8 MSB-first value bytes.
+        assert_eq!(
+            Message::EchoRequest { value: 1 }.encode(),
+            [8, 0, 0, 0, 0, 0, 0, 0, 1]
+        );
+
+        // Bad inputs are rejected, not panicked on.
+        assert!(Message::decode(&[]).is_err()); // empty
+        assert!(Message::decode(&[0]).is_err()); // NONE
+        assert!(Message::decode(&[99]).is_err()); // unknown type
+        assert!(Message::decode(&[8, 0, 0]).is_err()); // echo, short value
     }
 }

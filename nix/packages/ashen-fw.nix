@@ -4,7 +4,6 @@
   rust-bin,
   rust-analyzer,
   probe-rs-tools,
-  protobuf,
 }:
 let
   cargoToml = builtins.fromTOML (builtins.readFile ../../Cargo.toml);
@@ -29,7 +28,6 @@ rustPlatform.buildRustPackage {
   nativeBuildInputs = [
     rust-analyzer
     probe-rs-tools
-    protobuf
   ];
 
   # Disable auditable for embedded targets (doesn't work with rust-lld)
