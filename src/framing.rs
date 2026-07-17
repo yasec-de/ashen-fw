@@ -63,11 +63,29 @@ pub struct ResetReader<T> {
     /// Set once the first reset has been accepted. Before that, all inbound
     /// data is ignored (per the protocol: ignore everything until reset once).
     armed: bool,
+    /// Bulk read-ahead buffer. `read_raw` drains the underlying UART in chunks
+    /// rather than one byte per `await`: at 1 Mbaud a byte arrives every ~10 us,
+    /// too fast for a per-byte executor round-trip to keep up, so the
+    /// `BufferedUart` RX ring would overflow and silently drop mid-frame bytes.
+    rx_buf: [u8; RX_CHUNK_LEN],
+    rx_pos: usize,
+    rx_len: usize,
 }
+
+/// Read-ahead chunk size, matched to the `BufferedUart` RX ring so one refill
+/// can drain a full ring's worth in a single `await`.
+const RX_CHUNK_LEN: usize = 256;
 
 impl<T: Read + Write> ResetReader<T> {
     pub fn new(io: T) -> Self {
-        Self { io, null_run: 0, armed: false }
+        Self {
+            io,
+            null_run: 0,
+            armed: false,
+            rx_buf: [0; RX_CHUNK_LEN],
+            rx_pos: 0,
+            rx_len: 0,
+        }
     }
 
     pub fn into_inner(self) -> T {
@@ -78,13 +96,31 @@ impl<T: Read + Write> ResetReader<T> {
     /// data through without first requiring a reset.
     #[cfg(test)]
     pub fn armed_for_test(io: T) -> Self {
-        Self { io, null_run: 0, armed: true }
+        Self {
+            io,
+            null_run: 0,
+            armed: true,
+            rx_buf: [0; RX_CHUNK_LEN],
+            rx_pos: 0,
+            rx_len: 0,
+        }
     }
 
     async fn read_raw(&mut self) -> Result<u8, Error> {
-        let mut byte = [0u8; 1];
-        self.io.read_exact(&mut byte).await.map_err(|_| Error::Io)?;
-        Ok(byte[0])
+        if self.rx_pos >= self.rx_len {
+            // Buffer drained: refill with one bulk read. A single `read` returns
+            // as many bytes as are already waiting in the RX ring, so a burst is
+            // consumed in one `await` instead of one per byte.
+            let n = self.io.read(&mut self.rx_buf).await.map_err(|_| Error::Io)?;
+            if n == 0 {
+                return Err(Error::Io);
+            }
+            self.rx_pos = 0;
+            self.rx_len = n;
+        }
+        let byte = self.rx_buf[self.rx_pos];
+        self.rx_pos += 1;
+        Ok(byte)
     }
 
     /// Reads one byte, treating a run of at least [`RESET_NULL_RUN`] `0x00`
