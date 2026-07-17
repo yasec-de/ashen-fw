@@ -25,6 +25,16 @@ rustPlatform.buildRustPackage {
     lockFile = ../../Cargo.lock;
   };
 
+  # embassy-stm32 0.6.0 (and upstream main as of 2026-07) resets the GPDMA
+  # channel in configure_linked_list() without first suspending it. On a
+  # stop/restart of the ring-buffered UART RX (e.g. after a UART error) this
+  # raises a GPDMA user-settings error, whose IRQ handler panics — observed as
+  # a HardFault mid-session. The vendored crate copy is writable, so patch it.
+  postPatch = ''
+    patch -p1 -d "$cargoDepsCopy/embassy-stm32-0.6.0" \
+      < ${../patches/embassy-stm32-gpdma-linked-list-reset.patch}
+  '';
+
   nativeBuildInputs = [
     rust-analyzer
     probe-rs-tools

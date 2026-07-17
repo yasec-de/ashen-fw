@@ -70,6 +70,12 @@ pub struct ResetReader<T> {
     rx_buf: [u8; RX_CHUNK_LEN],
     rx_pos: usize,
     rx_len: usize,
+    /// Partial-frame accumulator for [`read_frame`]. Lives here rather than in
+    /// a local of `read_frame` so that a frame in progress survives the future
+    /// being cancelled: `run_session` drops its receive future whenever a log
+    /// frame is queued mid-session (via `select`), and losing already-consumed
+    /// frame bytes there desyncs the stream and poisons the next decrypt.
+    frame_buf: Vec<u8>,
 }
 
 /// Read-ahead chunk size, matched to the `BufferedUart` RX ring so one refill
@@ -85,6 +91,7 @@ impl<T: Read + Write> ResetReader<T> {
             rx_buf: [0; RX_CHUNK_LEN],
             rx_pos: 0,
             rx_len: 0,
+            frame_buf: Vec::new(),
         }
     }
 
@@ -103,6 +110,7 @@ impl<T: Read + Write> ResetReader<T> {
             rx_buf: [0; RX_CHUNK_LEN],
             rx_pos: 0,
             rx_len: 0,
+            frame_buf: Vec::new(),
         }
     }
 
@@ -208,19 +216,34 @@ pub async fn sync_frame<T: Read + Write>(io: &mut ResetReader<T>) -> Result<(), 
 /// If the frame exceeds [`MAX_FRAME_LEN`], bytes are still
 /// consumed up to (and including) the delimiter before returning
 /// [`Error::Overflow`]
+///
+/// Cancellation-safe: a partially read frame is accumulated in the
+/// [`ResetReader`] rather than a local, so dropping the future mid-frame
+/// (as `run_session`'s `select` does whenever a log frame is queued) loses
+/// no bytes; the next call resumes the same frame.
 pub async fn read_frame<T: Read + Write>(io: &mut ResetReader<T>) -> Result<Vec<u8>, Error> {
     // ponytail: needs Write too because `read_byte` may emit the reset reply.
-    let mut buf = Vec::new();
     loop {
-        let byte = io.read_byte().await?;
+        let byte = match io.read_byte().await {
+            Ok(byte) => byte,
+            Err(e) => {
+                // Reset or I/O error: any frame in progress is dead. Drop it
+                // so it cannot poison the first frame of the next session.
+                io.frame_buf.clear();
+                return Err(e);
+            }
+        };
 
         if byte == 0x00 {
-            return decode(&buf)
+            let frame = decode(&io.frame_buf);
+            io.frame_buf.clear();
+            return frame;
         }
 
-        if buf.len() < MAX_FRAME_LEN {
-            buf.push(byte);
+        if io.frame_buf.len() < MAX_FRAME_LEN {
+            io.frame_buf.push(byte);
         } else {
+            io.frame_buf.clear();
             sync_frame(io).await?;
             return Err(Error::Overflow)
         }

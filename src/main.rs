@@ -67,13 +67,24 @@ impl embedded_io_async::ErrorType for SplitIo {
 
 impl Read for SplitIo {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-        self.rx.read(buf).await
+        // Error-only logging: a log on the success path would be forwarded
+        // over this same link by `run_session`, whose `select` then cancels
+        // and re-polls the receive future — re-arming itself forever.
+        let r = self.rx.read(buf).await;
+        if let Err(e) = &r {
+            defmt::warn!("uart rd err {}", e);
+        }
+        r
     }
 }
 
 impl Write for SplitIo {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        self.tx.write(buf).await?;
+        // Error-only logging; see `read` above for why success must not log.
+        if let Err(e) = self.tx.write(buf).await {
+            defmt::warn!("uart wr err {}", e);
+            return Err(e);
+        }
         Ok(buf.len())
     }
 
@@ -188,6 +199,8 @@ async fn main(spawner: Spawner) {
             .expect("link is always present at the start of a session")
             .run_session(&mut keystore)
             .await;
+
+        defmt::info!("session end: {}", defmt::Debug2Format(&end));
 
         if let SessionEnd::Erased = end {
             keystore.erase();

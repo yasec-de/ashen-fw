@@ -1,0 +1,109 @@
+diff -ru embassy-stm32-0.6.0.orig/src/dma/gpdma/mod.rs embassy-stm32-0.6.0/src/dma/gpdma/mod.rs
+--- embassy-stm32-0.6.0.orig/src/dma/gpdma/mod.rs	2026-07-17 18:17:25.277511163 +0200
++++ embassy-stm32-0.6.0/src/dma/gpdma/mod.rs	2026-07-17 18:29:18.175547236 +0200
+@@ -209,8 +209,13 @@
+     }
+ 
+     if sr.suspf() {
+-        // Disable all xxIEs to prevent the irq from firing again.
+-        ch.cr().write(|_| {});
++        // Mask only the suspend interrupt to prevent it from firing again.
++        // A full CR write here would clear SUSP — resuming a channel that a
++        // concurrent (re)configure on the thread side just suspended — and
++        // that reconfigure's CR.RESET then hits an active channel, raising a
++        // user settings error (USEF). Keeping SUSP and the SUSPF flag intact
++        // also preserves is_running() == false for poll_stop()/blocking_wait().
++        ch.cr().modify(|w| w.set_suspie(false));
+     }
+     state.waker.wake();
+ }
+@@ -334,6 +339,15 @@
+         // "Preceding reads and writes cannot be moved past subsequent writes."
+         fence(Ordering::SeqCst);
+ 
++        // CR.RESET may only be written while the channel is disabled or
++        // suspended (RM0456); doing so on an active channel raises a user
++        // settings error (USEF), which on_irq() escalates to a panic. Mirror
++        // the guard `configure()` uses: suspend and wait before resetting.
++        if ch.cr().read().en() {
++            ch.cr().modify(|w| w.set_susp(true));
++            while !ch.sr().read().suspf() {}
++        }
++
+         ch.cr().write(|w| w.set_reset(true));
+         ch.fcr().write(|w| {
+             // Clear all irqs
+diff -ru embassy-stm32-0.6.0.orig/src/dma/gpdma/ringbuffered.rs embassy-stm32-0.6.0/src/dma/gpdma/ringbuffered.rs
+--- embassy-stm32-0.6.0.orig/src/dma/gpdma/ringbuffered.rs	2026-07-17 18:29:11.729083730 +0200
++++ embassy-stm32-0.6.0/src/dma/gpdma/ringbuffered.rs	2026-07-17 18:37:07.123396769 +0200
+@@ -7,7 +7,7 @@
+ use core::task::Waker;
+ 
+ use super::{Channel, STATE, TransferOptions};
+-use crate::dma::gpdma::linked_list::{RunMode, Table};
++use crate::dma::gpdma::linked_list::{LinearItem, RunMode, Table};
+ use crate::dma::ringbuffer::{DmaCtrl, Error, ReadableDmaRingBuffer, WritableDmaRingBuffer};
+ use crate::dma::word::Word;
+ use crate::dma::{Dir, Request};
+@@ -51,7 +51,7 @@
+     channel: Channel<'a>,
+     _wake_guard: WakeGuard,
+     ringbuf: ReadableDmaRingBuffer<'a, W>,
+-    table: Table<2>,
++    table: Table<1>,
+     options: TransferOptions,
+ }
+ 
+@@ -66,7 +66,22 @@
+         buffer: &'a mut [W],
+         options: TransferOptions,
+     ) -> Self {
+-        let table = Table::<2>::new_ping_pong::<W>(request, peri_addr, buffer, Dir::PeripheralToMemory);
++        // A single LLI spanning the whole buffer, self-linked to run
++        // circularly, instead of the two ping-pong half-buffer items. With two
++        // items the DMA position must be derived from the software-tracked LLI
++        // index (updated in the irq handler) plus the live BNDT register; at
++        // the half-buffer switchover these two desync and the ring computes a
++        // bogus write position, corrupting reads. With one item BNDT alone is
++        // the exact position, race-free. HTF/TCF still fire at the half-way
++        // point and at wrap, so wake granularity is unchanged.
++        let table = Table::new([unsafe { LinearItem::new_read(request, peri_addr, buffer) }]);
++
++        // With a single LLI the half-buffer wake comes from the HTF event
++        // rather than the per-half-item TCF, so the half-transfer interrupt
++        // must always be on; TCF (at wrap) drives the complete counter.
++        let mut options = options;
++        options.half_transfer_ir = true;
++        options.complete_transfer_ir = true;
+ 
+         Self {
+             _wake_guard: channel.info().wake_guard(),
+@@ -82,6 +97,28 @@
+         // Apply the default configuration to the channel.
+         unsafe { self.channel.configure_linked_list(&self.table, self.options) };
+         self.table.link(RunMode::Circular);
++
++        // Pre-load item 0 into the channel registers instead of relying on
++        // the empty-LLI0 fetch after enable: BNDT then reads the full buffer
++        // length from the instant the channel is configured, so the index
++        // reset below observes hardware position 0 instead of a transient
++        // empty block (which would desync the ring from the hardware).
++        let info = self.channel.info();
++        let ch = info.dma.ch(info.num);
++        let item = &self.table.items[0];
++        ch.tr1().write_value(item.tr1);
++        ch.tr2().write_value(item.tr2);
++        ch.br1().write_value(item.br1);
++        ch.sar().write_value(item.sar);
++        ch.dar().write_value(item.dar);
++        ch.llr().write_value(item.llr);
++
++        // Drop any stale software ring state from a previous run of this
++        // channel (a stop/restart cycle otherwise leaves the read/write
++        // indices pointing into the old stream while the hardware restarts
++        // from position 0, yielding stale data or phantom availability).
++        self.clear();
++
+         self.channel.start();
+     }
+ 
