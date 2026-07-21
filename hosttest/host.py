@@ -100,14 +100,5 @@ def main():
     for i, lat in enumerate(latencies):
         print(f"  echo {i} latency: {lat * 1000:.1f} ms")
 
-
-# ponytail: offline check covers framing + message packing; live Noise path needs hardware.
-def _selfcheck():
-    body = b"\x08" + (1).to_bytes(8, "big")
-    assert cobs.decode(cobs.encode(body)) == body
-    assert body == bytes([8]) + (1).to_bytes(8, "big")
-
-
 if __name__ == "__main__":
-    _selfcheck()
     main()

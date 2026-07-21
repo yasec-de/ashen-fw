@@ -67,14 +67,19 @@ impl embedded_io_async::ErrorType for SplitIo {
 
 impl Read for SplitIo {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-        // Error-only logging: a log on the success path would be forwarded
-        // over this same link by `run_session`, whose `select` then cancels
-        // and re-polls the receive future — re-arming itself forever.
-        let r = self.rx.read(buf).await;
-        if let Err(e) = &r {
-            defmt::warn!("uart rd err {}", e);
-        }
-        r
+        // No logging here: an RX error (notably Overrun, which happens when the
+        // peer keeps sending while a flash-page erase stalls the CPU) would be
+        // forwarded over this same link by `run_session`, whose `select` then
+        // cancels and re-polls the receive future — a feedback storm that wedges
+        // the link.
+        //
+        // On Overrun, embassy stops DMA and returns the error; the error ends
+        // the session and `responder_handshake_retry`'s next `read` re-arms DMA
+        // automatically (see `RingBufferedUartRx::read`). The framing/handshake
+        // layer then simply waits for the peer's next reset — a full reconnect,
+        // with the Noise state de-inited by the fresh `build_responder()`. So the
+        // error must propagate as-is; we neither swallow it nor inject a reset.
+        self.rx.read(buf).await
     }
 }
 

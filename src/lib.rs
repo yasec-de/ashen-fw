@@ -4,7 +4,7 @@ extern crate alloc;
 
 pub mod cobs;
 pub mod framing;
-// ponytail: disabled on the U5 port. The regular-group DMA ring scan relies on
+// disabled on the U5 port. The regular-group DMA ring scan relies on
 // embassy-stm32's ring-buffered ADC API (`into_ring_buffered`/`RingBufferedAdc`),
 // which 0.6 gates to G4/v2/v3-class ADCs and does NOT provide for the U5 (adc_v4).
 // The PAC-level injected group + AWD1/AWD2 watchdogs are already U5-ported; re-enable

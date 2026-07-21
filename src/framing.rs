@@ -26,8 +26,12 @@ pub const RESET_NULL_RUN: usize = 8;
 /// handshake begins.
 pub const RESET_REPLY_NULLS: usize = 32;
 
-/// Maximum number of plaintext payload bytes in a single COBS frame
-pub const MAX_PAYLOAD_LEN: usize = 1024;
+/// Maximum number of plaintext payload bytes in a single COBS frame.
+///
+/// Kept small (256 B) so peak concurrent heap stays well under the 4 KB
+/// `emballoc` arena: a `receive` holds a frame `Vec` plus a plaintext `Vec`
+/// live at once, and `run_session` can interleave that with a `send`.
+pub const MAX_PAYLOAD_LEN: usize = 256;
 
 /// Maximum size of a COBS frame after encoding
 pub const MAX_FRAME_LEN: usize = MAX_PAYLOAD_LEN + MAX_PAYLOAD_LEN / 254 + 2;

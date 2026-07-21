@@ -146,8 +146,11 @@ impl<T: Read + Write> NoiseLink<T> {
             match Self::responder_handshake(io, local_static_key, fresh_rng(), keystore).await {
                 Ok(link) => return link,
                 Err((_e, returned_io)) => {
-                    #[cfg(target_os = "none")]
-                    defmt::warn!("Handshake failed, retrying");
+                    // No log here: a failed handshake is the normal case during a
+                    // reconnect (the peer resets mid-handshake), and this retry
+                    // loop can spin many times per second. A log would be
+                    // forwarded over this same link as a frame, amplifying the
+                    // reconnect churn into a feedback storm that wedges the link.
                     io = returned_io;
                 }
             }

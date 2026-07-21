@@ -32,4 +32,3 @@ pub async fn monitor_contacts<const N: usize, const M: usize>(
         }
     }
 }
-
