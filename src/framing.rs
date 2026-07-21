@@ -58,9 +58,10 @@ impl fmt::Display for Error {
 /// Until the first reset is seen, [`read_byte`](Self::read_byte) never yields
 /// data — it consumes and discards the incoming stream, only ever returning
 /// [`Error::Reset`] once a reset arrives. When the null run reaches the
-/// threshold it replies with [`RESET_REPLY_NULLS`] `0x00` bytes and returns
-/// [`Error::Reset`]; any further nulls of an over-long run are swallowed on
-/// subsequent reads without re-firing.
+/// threshold it replies with [`RESET_REPLY_NULLS`] `0x00` bytes, returns
+/// [`Error::Reset`], and clears its run counter, so a subsequent run of
+/// [`RESET_NULL_RUN`] nulls (the peer's next reconnect) fires again even with
+/// no intervening non-null byte.
 pub struct ResetReader<T> {
     io: T,
     null_run: usize,
@@ -145,18 +146,21 @@ impl<T: Read + Write> ResetReader<T> {
             if byte == 0x00 {
                 self.null_run += 1;
                 if self.null_run == RESET_NULL_RUN {
-                    // Exactly at threshold: this is the reset. Reply once and
-                    // report it. Any further nulls (an over-long run) are
-                    // swallowed by the `> RESET_NULL_RUN` branch below on the
-                    // next reads, without re-firing.
+                    // Reached the threshold: this is a reset. Reply once and
+                    // report it, then clear the counter so the NEXT run of
+                    // RESET_NULL_RUN nulls fires again. The peer reconnects by
+                    // sending nothing but back-to-back reset runs (no non-null
+                    // byte in between), so if firing left the counter at the
+                    // threshold, every following null would be swallowed as an
+                    // "over-long run" and no further reset would ever fire --
+                    // the link would wedge silently. Clearing to 0 costs only
+                    // an over-long single run re-firing every RESET_NULL_RUN
+                    // nulls, which the initiator's reply drain tolerates.
                     let reply = [0u8; RESET_REPLY_NULLS];
                     self.io.write_all(&reply).await.map_err(|_| Error::Io)?;
                     self.armed = true;
+                    self.null_run = 0;
                     return Err(Error::Reset);
-                }
-                if self.null_run > RESET_NULL_RUN {
-                    // Trailing null of the same over-long run; already handled.
-                    continue;
                 }
             } else {
                 self.null_run = 0;
@@ -495,6 +499,34 @@ mod tests {
             }
             assert!(matches!(read_frame(&mut io).await, Err(Error::Reset)));
             assert_eq!(io.io.out.len(), RESET_REPLY_NULLS);
+        });
+    }
+
+    #[test]
+    fn back_to_back_resets_all_fire() {
+        // Regression: the peer reconnects by sending nothing but back-to-back
+        // RESET_NULL_RUN-null runs, with no non-null byte in between. Each run
+        // must fire its own reset. (Previously the run counter was left at the
+        // threshold after firing, so every null past the first reset was
+        // swallowed as an "over-long run" and no later reset ever fired --
+        // the link wedged silently.)
+        embassy_futures::block_on(async {
+            // Three resets' worth of nulls, contiguous. Extra nulls beyond a
+            // multiple of RESET_NULL_RUN would only start an incomplete next
+            // run, so keep it an exact multiple.
+            let data: Vec<u8> = core::iter::repeat(0x00).take(RESET_NULL_RUN * 3).collect();
+            let mut io = ResetReader::armed_for_test(SliceIo::new(data));
+
+            let mut resets = 0;
+            // Each RESET_NULL_RUN-th null fires a reset; the ones before it
+            // surface as empty-frame delimiters.
+            for _ in 0..RESET_NULL_RUN * 3 {
+                if matches!(read_frame(&mut io).await, Err(Error::Reset)) {
+                    resets += 1;
+                }
+            }
+            assert_eq!(resets, 3, "each contiguous reset run must fire");
+            assert_eq!(io.io.out.len(), RESET_REPLY_NULLS * 3);
         });
     }
 

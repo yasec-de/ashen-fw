@@ -45,7 +45,7 @@ pub trait PanicReport: Send {
 impl<T: Read + IoWrite + Send> PanicReport for Option<NoiseLink<T>> {
     fn flush_log_queue(&mut self) {
         if let Some(link) = self {
-            let _ = embassy_futures::block_on(NoiseLink::flush_log_queue(link));
+            let _ = embassy_futures::block_on(NoiseLink::drain_log_queue(link));
         }
     }
 }

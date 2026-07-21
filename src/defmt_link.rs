@@ -250,18 +250,25 @@ impl LogQueue {
     /// Pops the oldest queued frame into `out`, returning its length, or
     /// `None` if the queue is empty.
     fn pop(&self, out: &mut [u8]) -> Option<usize> {
-        critical_section::with(|_| unsafe {
+        let (result, more) = critical_section::with(|_| unsafe {
             let inner = &mut *self.0.get();
             if inner.count == 0 {
-                return None;
+                return (None, false);
             }
             let frame = &inner.frames[inner.head];
             let len = frame.len.min(out.len());
             out[..len].copy_from_slice(&frame.data[..len]);
             inner.head = (inner.head + 1) % LOG_QUEUE_CAPACITY;
             inner.count -= 1;
-            Some(len)
-        })
+            (Some(len), inner.count > 0)
+        });
+        // The consumer drains one frame per LOG_SIGNAL. Since `Signal` is a
+        // latch (not a counter), re-arm it while frames remain so the backlog
+        // keeps draining without waiting for the next `push`.
+        if more {
+            LOG_SIGNAL.signal(());
+        }
+        result
     }
 }
 
@@ -280,7 +287,9 @@ pub fn pop_log_frame(out: &mut [u8]) -> Option<usize> {
     LOG_QUEUE.pop(out)
 }
 
-/// Resolves once a new log frame has been queued since the last call.
+/// Resolves once at least one log frame is available to send. The consumer
+/// drains one frame per resolution; `pop` re-arms the signal while frames
+/// remain, so a multi-frame backlog wakes the consumer repeatedly.
 pub async fn wait_for_log_frame() {
     LOG_SIGNAL.wait().await;
 }

@@ -195,13 +195,36 @@ impl<T: Read + Write> NoiseLink<T> {
         self.send_msg(&Message::Log(data.into())).await
     }
 
-    /// Sends any `defmt` log frames queued by [`crate::defmt_link`] as
-    /// [`Message::Log`] messages.
-    pub(crate) async fn flush_log_queue(&mut self) -> Result<(), Error> {
+    /// Sends the single oldest queued `defmt` log frame as a
+    /// [`Message::Log`], if any is queued. Returns whether a frame was sent.
+    ///
+    /// Sends *one* frame per call, never draining the whole backlog: logs are
+    /// the lowest-priority traffic on the link, and the session loop only
+    /// calls this when no real protocol message is waiting. Draining the whole
+    /// queue here would blast the boot-time log backlog as one back-to-back
+    /// burst, overrunning the host UART (no flow control) and desyncing the
+    /// Noise transport counter on the first dropped frame.
+    pub(crate) async fn flush_one_log(&mut self) -> Result<bool, Error> {
         let mut buf = [0u8; MAX_LOG_FRAME_LEN];
-        while let Some(len) = pop_log_frame(&mut buf) {
-            self.send_log_message(&buf[..len]).await?;
+        match pop_log_frame(&mut buf) {
+            Some(len) => {
+                self.send_log_message(&buf[..len]).await?;
+                Ok(true)
+            }
+            None => Ok(false),
         }
+    }
+
+    /// Drains the entire log queue as back-to-back [`Message::Log`] messages.
+    ///
+    /// Only for the panic path ([`crate::panic_link`]): there is no live
+    /// session to protect, so getting every pending log out before the fault
+    /// takes priority. The normal session loop uses [`flush_one_log`] instead,
+    /// which never bursts the whole backlog.
+    ///
+    /// [`flush_one_log`]: Self::flush_one_log
+    pub(crate) async fn drain_log_queue(&mut self) -> Result<(), Error> {
+        while self.flush_one_log().await? {}
         Ok(())
     }
 
@@ -259,10 +282,11 @@ impl<T: Read + Write> NoiseLink<T> {
 
     pub async fn run_session<K: KeyStore>(&mut self, keystore: &mut K) -> SessionEnd {
         loop {
-            if let Err(e) = self.flush_log_queue().await {
-                return SessionEnd::Error(e);
-            }
-
+            // Real protocol messages always win: race an inbound message
+            // against "a log frame is available". Logs are only ever sent in
+            // the gaps when nothing is being received, and one frame at a time,
+            // so a message queued mid-log-burst is serviced right after the
+            // current frame rather than behind the whole backlog.
             match select(self.receive_msg(), wait_for_log_frame()).await {
                 Either::First(result) => {
                     let result = match result {
@@ -272,14 +296,17 @@ impl<T: Read + Write> NoiseLink<T> {
                     match result {
                         Ok(Some(end)) => return end,
                         Ok(None) => {}
-                        Err(e) => {
-                            return SessionEnd::Error(e);
-                        }
+                        Err(e) => return SessionEnd::Error(e),
                     }
                 }
 
-                // A new log frame was queued; loop back around to flush it.
-                Either::Second(()) => {}
+                // No message pending and a log frame is queued: send exactly
+                // one, then loop back so a freshly-arrived message preempts the
+                // rest of the backlog.
+                Either::Second(()) => match self.flush_one_log().await {
+                    Ok(_) => {}
+                    Err(e) => return SessionEnd::Error(e),
+                },
             }
         }
     }

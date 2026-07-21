@@ -172,6 +172,17 @@ impl<T: Read + Write> NoiseLink<T> {
             };
         }
 
+        // Build the responder state -- including the slow curve25519 static
+        // pubkey derivation -- BEFORE waiting for the peer's first frame.
+        //
+        // `build_responder` runs a full curve25519 base-point multiply, which
+        // takes well over 100 ms on this core. If it ran after the reset reply
+        // went out, the initiator (which starts its handshake timeout the
+        // instant it sees our reply) would send `-> e` and time out waiting for
+        // `<- e, ee, s, es` while we were still grinding the DH -- then reset
+        // and retry, forever. Doing it here means that by the time the reset
+        // reply is emitted (inside the `read_frame` below, from `read_byte`)
+        // the state is ready and `-> e` is serviced immediately.
         let mut hs = tri!((|| {
             builder(rng)?
                 .local_private_key(local_static_key)?
@@ -181,7 +192,8 @@ impl<T: Read + Write> NoiseLink<T> {
 
         let mut buf = vec![0u8; framing::MAX_PAYLOAD_LEN];
 
-        // -> e
+        // -> e  (the read that consumes the peer's reset run and, from inside
+        // `read_byte`, emits the 32-null reset reply)
         let msg = tri!(framing::read_frame(&mut io).await);
         tri!(hs.read_message(&msg, &mut buf));
 
