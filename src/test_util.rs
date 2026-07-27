@@ -67,6 +67,7 @@ impl KeyStore for TestKeyStore {
 }
 
 /// Initiator-side handshake code mirroring [`NoiseLink::responder_handshake`] for integration tests.
+#[cfg(any(test, feature = "test-util"))]
 impl<T: Read + Write> NoiseLink<T> {
     pub async fn initiator_handshake(
         io: T,
