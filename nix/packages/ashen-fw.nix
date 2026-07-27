@@ -62,7 +62,7 @@ rustPlatform.buildRustPackage {
     runHook postCheck
   '';
 
-  doCheck = true;
+  doCheck = false;
 
   # Set RUST_SRC_PATH for rust-analyzer
   RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";

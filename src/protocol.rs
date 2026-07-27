@@ -179,31 +179,19 @@ pub enum SessionEnd {
 }
 
 impl<T: Read + Write> NoiseLink<T> {
-    /// Encodes `msg` and sends it as a single transport message.
     pub async fn send_msg(&mut self, msg: &Message) -> Result<(), Error> {
         self.send(&msg.encode()).await
     }
 
-    /// Receives a single transport message and decodes it.
     pub async fn receive_msg(&mut self) -> Result<Message, Error> {
         let payload = self.receive().await?;
         Message::decode(&payload)
     }
 
-    /// Sends `data` (a single encoded `defmt` log frame) as a [`Message::Log`].
     pub async fn send_log_message(&mut self, data: &[u8]) -> Result<(), Error> {
         self.send_msg(&Message::Log(data.into())).await
     }
 
-    /// Sends the single oldest queued `defmt` log frame as a
-    /// [`Message::Log`], if any is queued. Returns whether a frame was sent.
-    ///
-    /// Sends *one* frame per call, never draining the whole backlog: logs are
-    /// the lowest-priority traffic on the link, and the session loop only
-    /// calls this when no real protocol message is waiting. Draining the whole
-    /// queue here would blast the boot-time log backlog as one back-to-back
-    /// burst, overrunning the host UART (no flow control) and desyncing the
-    /// Noise transport counter on the first dropped frame.
     pub(crate) async fn flush_one_log(&mut self) -> Result<bool, Error> {
         let mut buf = [0u8; MAX_LOG_FRAME_LEN];
         match pop_log_frame(&mut buf) {
@@ -215,14 +203,6 @@ impl<T: Read + Write> NoiseLink<T> {
         }
     }
 
-    /// Drains the entire log queue as back-to-back [`Message::Log`] messages.
-    ///
-    /// Only for the panic path ([`crate::panic_link`]): there is no live
-    /// session to protect, so getting every pending log out before the fault
-    /// takes priority. The normal session loop uses [`flush_one_log`] instead,
-    /// which never bursts the whole backlog.
-    ///
-    /// [`flush_one_log`]: Self::flush_one_log
     pub(crate) async fn drain_log_queue(&mut self) -> Result<(), Error> {
         while self.flush_one_log().await? {}
         Ok(())
@@ -240,9 +220,6 @@ impl<T: Read + Write> NoiseLink<T> {
                 Ok(None)
             }
             Message::Disconnect => {
-                // Courtesy acknowledgement. The peer that asked to disconnect
-                // may already have dropped the link, so a failed send here is
-                // not a session error: we are ending the session regardless.
                 let _ = self.send_msg(&Message::Disconnect).await;
                 Ok(Some(SessionEnd::Disconnected))
             }

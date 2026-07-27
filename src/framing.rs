@@ -87,17 +87,13 @@ impl<T: Read + Write> ResetReader<T> {
                     let reply = [0u8; RESET_REPLY_NULLS];
                     self.io.write_all(&reply).await.map_err(|_| Error::Io)?;
                     self.sync = true;
-                    self.null_run = 0;
                     return Err(Error::Reset);
-                } else if self.null_run > 1 {
-                    continue;
                 }
             } else {
                 self.null_run = 0;
-            }
-
-            if self.sync {
-                return Ok(byte);
+                if self.sync {
+                    return Ok(byte);
+                }
             }
         }
     }
