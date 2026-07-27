@@ -125,14 +125,6 @@ pub struct NoiseLink<T> {
 }
 
 impl<T: Read + Write> NoiseLink<T> {
-    /// Performs the responder side of a Noise_XX handshake (`<- e, ee, s,
-    /// es` then `-> s, se`), verifying the initiator's static key against
-    /// `keystore` via TOFU.
-    /// Performs [`responder_handshake`](Self::responder_handshake), retrying
-    /// on any error (including a link reset mid-handshake) with a fresh RNG
-    /// each attempt. Because a reset is the normal way a peer (re)connects,
-    /// this never gives up: it keeps the `ResetReader` (and its post-reset
-    /// armed state) and re-runs the handshake until one completes.
     pub async fn responder_handshake_retry<K: KeyStore, F>(
         mut io: ResetReader<T>,
         local_static_key: &[u8],
@@ -146,11 +138,6 @@ impl<T: Read + Write> NoiseLink<T> {
             match Self::responder_handshake(io, local_static_key, fresh_rng(), keystore).await {
                 Ok(link) => return link,
                 Err((_e, returned_io)) => {
-                    // No log here: a failed handshake is the normal case during a
-                    // reconnect (the peer resets mid-handshake), and this retry
-                    // loop can spin many times per second. A log would be
-                    // forwarded over this same link as a frame, amplifying the
-                    // reconnect churn into a feedback storm that wedges the link.
                     io = returned_io;
                 }
             }
@@ -163,48 +150,47 @@ impl<T: Read + Write> NoiseLink<T> {
         rng: Box<dyn Random>,
         keystore: &mut K,
     ) -> Result<Self, (Error, ResetReader<T>)> {
-        macro_rules! tri {
-            ($e:expr) => {
-                match $e {
-                    Ok(v) => v,
-                    Err(e) => return Err((Error::from(e), io)),
-                }
-            };
-        }
-
-        // Build the responder state -- including the slow curve25519 static
-        // pubkey derivation -- BEFORE waiting for the peer's first frame.
-        //
-        // `build_responder` runs a full curve25519 base-point multiply, which
-        // takes well over 100 ms on this core. If it ran after the reset reply
-        // went out, the initiator (which starts its handshake timeout the
-        // instant it sees our reply) would send `-> e` and time out waiting for
-        // `<- e, ee, s, es` while we were still grinding the DH -- then reset
-        // and retry, forever. Doing it here means that by the time the reset
-        // reply is emitted (inside the `read_frame` below, from `read_byte`)
-        // the state is ready and `-> e` is serviced immediately.
-        let mut hs = tri!((|| {
+        let mut hs = match (|| {
             builder(rng)?
                 .local_private_key(local_static_key)?
                 .build_responder()
                 .map_err(Error::from)
-        })());
+        })() {
+            Ok(v) => v,
+            Err(e) => return Err((e, io)),
+        };
 
         let mut buf = vec![0u8; framing::MAX_PAYLOAD_LEN];
 
-        // -> e  (the read that consumes the peer's reset run and, from inside
-        // `read_byte`, emits the 32-null reset reply)
-        let msg = tri!(framing::read_frame(&mut io).await);
-        tri!(hs.read_message(&msg, &mut buf));
+        let msg = match framing::read_frame(&mut io).await {
+            Ok(v) => v,
+            Err(e) => return Err((Error::from(e), io)),
+        };
+        if let Err(e) = hs.read_message(&msg, &mut buf) {
+            return Err((Error::from(e), io));
+        }
 
         // <- e, ee, s, es
-        let len = tri!(hs.write_message(&[], &mut buf));
-        tri!(framing::write_frame(&mut io, &buf[..len]).await);
+        let len = match hs.write_message(&[], &mut buf) {
+            Ok(v) => v,
+            Err(e) => return Err((Error::from(e), io)),
+        };
+        if let Err(e) = framing::write_frame(&mut io, &buf[..len]).await {
+            return Err((Error::from(e), io));
+        }
 
         // -> s, se
-        let msg = tri!(framing::read_frame(&mut io).await);
-        tri!(hs.read_message(&msg, &mut buf));
-        let transport = tri!(hs.into_transport_mode());
+        let msg = match framing::read_frame(&mut io).await {
+            Ok(v) => v,
+            Err(e) => return Err((Error::from(e), io)),
+        };
+        if let Err(e) = hs.read_message(&msg, &mut buf) {
+            return Err((Error::from(e), io));
+        }
+        let transport = match hs.into_transport_mode() {
+            Ok(v) => v,
+            Err(e) => return Err((Error::from(e), io)),
+        };
 
         let remote_static = transport
             .get_remote_static()
@@ -240,16 +226,10 @@ impl<T: Read + Write> NoiseLink<T> {
         self.peer_trusted
     }
 
-    /// Consumes the link, returning its underlying transport so a fresh
-    /// handshake can be performed over the same I/O channel (see
-    /// [`NoiseLink::responder_handshake`]). The [`ResetReader`] state (its
-    /// null-run counter and armed flag) is preserved across handshakes.
     pub fn into_io(self) -> ResetReader<T> {
         self.io
     }
 
-    /// Records the currently connected peer as the trusted peer
-    /// in `keystore`, and marks this link as trusted.
     pub fn trust<K: KeyStore>(&mut self, keystore: &mut K) -> Result<(), Error> {
         if keystore.trusted_key().is_some() {
             return Err(Error::AlreadyKeyed);
@@ -260,10 +240,7 @@ impl<T: Read + Write> NoiseLink<T> {
         Ok(())
     }
 
-    /// Encrypts and sends `payload` as a single transport message.
     pub async fn send(&mut self, payload: &[u8]) -> Result<(), Error> {
-        // Room for the plaintext plus the 16-byte AEAD authentication tag
-        // that `write_message` appends.
         const TAG_LEN: usize = 16;
         let mut ciphertext = vec![0u8; payload.len() + TAG_LEN];
         let len = self.transport.write_message(payload, &mut ciphertext)?;
@@ -271,7 +248,6 @@ impl<T: Read + Write> NoiseLink<T> {
         Ok(())
     }
 
-    /// Receives and decrypts a single transport message.
     pub async fn receive(&mut self) -> Result<Vec<u8>, Error> {
         let msg = framing::read_frame(&mut self.io).await?;
         let mut plaintext = vec![0u8; msg.len()];
@@ -280,7 +256,6 @@ impl<T: Read + Write> NoiseLink<T> {
         Ok(plaintext)
     }
 
-    /// Sends `request` and returns the corresponding response.
     pub async fn request(&mut self, request: &[u8]) -> Result<Vec<u8>, Error> {
         self.send(request).await?;
         self.receive().await

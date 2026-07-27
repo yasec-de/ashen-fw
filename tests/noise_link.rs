@@ -1,9 +1,4 @@
 //! Host-side test for the Noise_XX/COBS secure link in
-//! [`ashen_fw::noise_link`].
-//!
-//! Builds the link implementation for the host architecture, wires up two
-//! in-process, in-memory transports (one per direction) to emulate a
-//! USART, and runs a full handshake plus two echo round trips.
 
 use std::thread;
 
@@ -31,9 +26,6 @@ fn handshake_and_echo_round_trips() {
                 NoiseLink::responder_handshake_retry(ResetReader::new(server_io), &server_static, || rng(0x00C0_FFEE), &mut keystore)
                     .await;
 
-            // Explicit pairing: a bare handshake neither records nor trusts
-            // the peer's static key. The server still learns it (so it can be
-            // committed later by a `PairRequest`), but treats it as untrusted.
             assert_eq!(keystore.trusted_key(), None);
             assert!(!link.is_peer_trusted());
             assert_eq!(link.peer_key(), client_public);
