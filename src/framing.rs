@@ -88,6 +88,8 @@ impl<T: Read + Write> ResetReader<T> {
                     self.io.write_all(&reply).await.map_err(|_| Error::Io)?;
                     self.sync = true;
                     return Err(Error::Reset);
+                } else if self.null_run == 1 {
+                    return Ok(0x00);
                 }
             } else {
                 self.null_run = 0;
