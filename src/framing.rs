@@ -6,7 +6,7 @@ use embedded_io_async::{Read, Write};
 
 pub use crate::cobs::{Error, decode, encode};
 
-pub const RESET_NULL_RUN: usize = 8;
+pub const RESET_NULL_RUN: usize = 24;
 pub const RESET_REPLY_NULLS: usize = 32;
 pub const MAX_PAYLOAD_LEN: usize = 256;
 pub const MAX_FRAME_LEN: usize = MAX_PAYLOAD_LEN + MAX_PAYLOAD_LEN / 254 + 2;
@@ -84,11 +84,15 @@ impl<T: Read + Write> ResetReader<T> {
             if byte == 0x00 {
                 self.null_run += 1;
                 if self.null_run == RESET_NULL_RUN {
-                    let reply = [0u8; RESET_REPLY_NULLS];
+                    let reply = [0u8; RESET_NULL_RUN];
                     self.io.write_all(&reply).await.map_err(|_| Error::Io)?;
                     self.sync = true;
                     return Err(Error::Reset);
-                } else if self.null_run == 1 {
+                } else if self.null_run > RESET_NULL_RUN {
+                    let reply = [0u8; 1];
+                    self.io.write_all(&reply).await.map_err(|_| Error::Io)?;
+                    return Ok(0x00);
+                } if self.null_run == 1 {
                     return Ok(0x00);
                 }
             } else {
@@ -149,6 +153,9 @@ pub async fn read_frame<T: Read + Write>(io: &mut ResetReader<T>) -> Result<Vec<
         };
 
         if byte == 0x00 {
+            if io.frame_buf.len() == 0 {
+                continue;
+            }
             let frame = decode(&io.frame_buf);
             io.frame_buf.clear();
             return frame;

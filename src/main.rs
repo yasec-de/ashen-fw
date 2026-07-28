@@ -107,7 +107,7 @@ async fn main(spawner: Spawner) {
 
     let flash = Flash::new_blocking(p.FLASH);
     let mut keystore = FlashKeyStore::new(flash);
-    let mut local_keys = generate_keypair(boxed_hw_rng()).expect("local keypair generation failed");
+    let local_keys = generate_keypair(boxed_hw_rng()).expect("local keypair generation failed");
 
     let mut usart_config = UsartConfig::default();
     usart_config.baudrate = 1_000_000;
@@ -125,16 +125,20 @@ async fn main(spawner: Spawner) {
 
     static RX_BUF: StaticCell<[u8; UART_BUF_LEN]> = StaticCell::new();
     let rx = rx.into_ring_buffered(RX_BUF.init([0; UART_BUF_LEN]));
-    let io = ResetReader::new(SplitIo { rx, tx });
+
+    static IO: StaticCell<SplitIo> = StaticCell::new();
+    let io = IO.init(SplitIo { rx, tx });
+    io.rx.start_uart();
+    let io = ResetReader::new(io);
     let link = NoiseLink::responder_handshake_retry(io, &local_keys.private, boxed_hw_rng, &mut keystore)
         .await;
     
-    static LINK: StaticCell<Option<NoiseLink<SplitIo>>> = StaticCell::new();
+    static LINK: StaticCell<Option<NoiseLink<&'static mut SplitIo>>> = StaticCell::new();
     let link = LINK.init(Some(link));
 
     // SAFETY: this creates a second `&'static mut` alias of `link`, used
     // only by the panic handler.
-    let panic_link: &'static mut Option<NoiseLink<SplitIo>> =
+    let panic_link: &'static mut Option<NoiseLink<&'static mut SplitIo>> =
         unsafe { &mut *(link as *mut _) };
     ashen_fw::panic_link::register(panic_link);
 
@@ -149,8 +153,6 @@ async fn main(spawner: Spawner) {
 
         if let SessionEnd::Erased = end {
             keystore.erase();
-            local_keys = generate_keypair(boxed_hw_rng())
-                .expect("local keypair generation failed");
         }
 
         let io = link.take().expect("link present").into_io();
