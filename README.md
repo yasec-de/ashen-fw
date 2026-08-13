@@ -136,7 +136,7 @@ ashen-fw/
 │   ├── protocol.rs               # Application request/response protocol
 │   ├── flash_keystore.rs         # Persisted remote static key (embedded-only)
 │   ├── hw_rng.rs                 # RNG peripheral driver (embedded-only)
-│   ├── defmt_link.rs             # defmt logging (embedded-only)
+│   ├── log.rs                    # plain-text logging over a byte pipe
 │   ├── panic_link.rs             # Panic reporting over the link (embedded-only)
 │   └── test_util.rs              # Host-side test helpers
 ├── nix/

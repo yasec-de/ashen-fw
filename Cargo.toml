@@ -34,12 +34,9 @@ snow = { version = "0.10.0", default-features = false, features = ["default-reso
 # default dependency set so that `ashen_fw::noise_link` and its tests build
 # and run for the host architecture.
 [target.'cfg(target_os = "none")'.dependencies]
-embassy-stm32 = { version = "0.6.0", features = ["defmt", "stm32u585ai", "unstable-pac", "time-driver-any", "exti", "memory-x"]  }
-embassy-sync = { version = "0.8.0", features = ["defmt"] }
-embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread", "defmt"] }
-embassy-time = { version = "0.5.1", features = ["defmt", "defmt-timestamp-uptime", "tick-hz-32_768"] }
-
-defmt = "1.1.0"
+embassy-stm32 = { version = "0.6.0", features = ["stm32u585ai", "unstable-pac", "time-driver-any", "exti", "memory-x"]  }
+embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread"] }
+embassy-time = { version = "0.5.1", features = ["tick-hz-32_768"] }
 
 cortex-m = { version = "0.7.7", features = ["inline-asm", "critical-section-single-core"] }
 cortex-m-rt = "0.7.5"
@@ -47,6 +44,13 @@ critical-section = "1.2"
 static_cell = { version = "2" }
 portable-atomic = { version = "1.5", features = ["unsafe-assume-single-core"] }
 emballoc = "0.3.0"
+
+# The log pipe in `src/log.rs` is guarded by a `CriticalSectionRawMutex`, which
+# needs a `critical-section` implementation to link. On the firmware that comes
+# from `cortex-m`'s `critical-section-single-core` above; host builds (the unit
+# tests and the integration tests under `tests/`) use the std-backed one.
+[target.'cfg(not(target_os = "none"))'.dependencies]
+critical-section = { version = "1.2", features = ["std"] }
 
 [features]
 default = []
@@ -70,7 +74,7 @@ opt-level = "s"     # Optimize for size in dev builds too
 opt-level = "z"     # Optimize for size
 lto = true          # Enable link-time optimization
 codegen-units = 1   # Better optimization
-debug = true        # Keep debug info for defmt, but smaller than debug = 2
+debug = true        # Keep debug info for debugging, but smaller than debug = 2
 strip = false       # Don't strip, we need symbols for debugging
 
 # The `verus!` macro in `src/cobs/codec.rs` expands to code annotated with

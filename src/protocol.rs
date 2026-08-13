@@ -25,9 +25,9 @@ use embedded_io_async::{Read, Write};
 
 use crate::noise_link::{Error, KeyStore, NoiseLink};
 
-/// Maximum size, in bytes, of a single encoded `defmt` log frame forwarded
-/// to the host as a [`MsgType::Log`] message. Longer frames are dropped by
-/// [`crate::defmt_link`].
+/// Maximum number of log bytes carried by a single [`MsgType::Log`] message.
+/// Log output is a byte stream (see [`crate::log`]), so it is chunked into
+/// messages of at most this size; chunk boundaries carry no meaning.
 pub const MAX_LOG_FRAME_LEN: usize = 128;
 
 /// Wire message type. The discriminant is the on-wire first byte.
@@ -67,7 +67,7 @@ impl MsgType {
 /// commands carry none.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
-    /// A single defmt-encoded log frame (`ASHEN_MSG_LOG`).
+    /// A chunk of log output (`ASHEN_MSG_LOG`).
     Log(Vec<u8>),
     Erase,
     PairRequest,
@@ -151,26 +151,6 @@ fn read_be64(payload: &[u8]) -> Result<u64, Error> {
     Ok(u64::from_be_bytes(bytes))
 }
 
-#[cfg(target_os = "none")]
-fn pop_log_frame(out: &mut [u8]) -> Option<usize> {
-    crate::defmt_link::pop_log_frame(out)
-}
-
-#[cfg(not(target_os = "none"))]
-fn pop_log_frame(_out: &mut [u8]) -> Option<usize> {
-    None
-}
-
-#[cfg(target_os = "none")]
-async fn wait_for_log_frame() {
-    crate::defmt_link::wait_for_log_frame().await
-}
-
-#[cfg(not(target_os = "none"))]
-async fn wait_for_log_frame() {
-    core::future::pending().await
-}
-
 #[derive(Debug)]
 pub enum SessionEnd {
     Disconnected,
@@ -192,20 +172,32 @@ impl<T: Read + Write> NoiseLink<T> {
         self.send_msg(&Message::Log(data.into())).await
     }
 
-    pub(crate) async fn flush_one_log(&mut self) -> Result<bool, Error> {
+    /// Forwards up to [`MAX_LOG_FRAME_LEN`] bytes of buffered log output to
+    /// the host, if any is pending. Does not wait for more: the caller has
+    /// already established readiness via [`crate::log::wait_readable`], and
+    /// reading without waiting keeps this safe to use as a cancellable
+    /// `select` arm.
+    pub(crate) async fn flush_one_log(&mut self) -> Result<(), Error> {
         let mut buf = [0u8; MAX_LOG_FRAME_LEN];
-        match pop_log_frame(&mut buf) {
-            Some(len) => {
-                self.send_log_message(&buf[..len]).await?;
-                Ok(true)
-            }
-            None => Ok(false),
+        let len = crate::log::try_read(&mut buf);
+        if len > 0 {
+            self.send_log_message(&buf[..len]).await?;
         }
+        Ok(())
     }
 
+    /// Forwards all log bytes buffered right now, without waiting for more.
+    /// Used by the panic handler, where the executor may no longer be able to
+    /// make progress on a pending read.
     pub(crate) async fn drain_log_queue(&mut self) -> Result<(), Error> {
-        while self.flush_one_log().await? {}
-        Ok(())
+        let mut buf = [0u8; MAX_LOG_FRAME_LEN];
+        loop {
+            let len = crate::log::try_read(&mut buf);
+            if len == 0 {
+                return Ok(());
+            }
+            self.send_log_message(&buf[..len]).await?;
+        }
     }
 
     async fn handle_message<K: KeyStore>(
@@ -230,8 +222,7 @@ impl<T: Read + Write> NoiseLink<T> {
             }
             Message::PairRequest => {
                 if keystore.trusted_key().is_some() {
-                    #[cfg(target_os = "none")]
-                    defmt::error!("Cannot pair while keyed, must be erased first");
+                    crate::error!("Cannot pair while keyed, must be erased first");
                     self.send_msg(&Message::PairResponse { success: false })
                         .await?;
                 } else {
@@ -250,8 +241,7 @@ impl<T: Read + Write> NoiseLink<T> {
                 Ok(None)
             }
             _ => {
-                #[cfg(target_os = "none")]
-                defmt::warn!("Unknown command received");
+                crate::warn!("Unknown command received");
                 Ok(None)
             }
         }
@@ -260,11 +250,11 @@ impl<T: Read + Write> NoiseLink<T> {
     pub async fn run_session<K: KeyStore>(&mut self, keystore: &mut K) -> SessionEnd {
         loop {
             // Real protocol messages always win: race an inbound message
-            // against "a log frame is available". Logs are only ever sent in
-            // the gaps when nothing is being received, and one frame at a time,
+            // against "log output is available". Logs are only ever sent in
+            // the gaps when nothing is being received, and one chunk at a time,
             // so a message queued mid-log-burst is serviced right after the
-            // current frame rather than behind the whole backlog.
-            match select(self.receive_msg(), wait_for_log_frame()).await {
+            // current chunk rather than behind the whole backlog.
+            match select(self.receive_msg(), crate::log::wait_readable()).await {
                 Either::First(result) => {
                     let result = match result {
                         Ok(msg) => self.handle_message(keystore, msg).await,
@@ -277,13 +267,14 @@ impl<T: Read + Write> NoiseLink<T> {
                     }
                 }
 
-                // No message pending and a log frame is queued: send exactly
-                // one, then loop back so a freshly-arrived message preempts the
-                // rest of the backlog.
-                Either::Second(()) => match self.flush_one_log().await {
-                    Ok(_) => {}
-                    Err(e) => return SessionEnd::Error(e),
-                },
+                // No message pending and log output is buffered: send exactly
+                // one chunk, then loop back so a freshly-arrived message
+                // preempts the rest of the backlog.
+                Either::Second(()) => {
+                    if let Err(e) = self.flush_one_log().await {
+                        return SessionEnd::Error(e);
+                    }
+                }
             }
         }
     }

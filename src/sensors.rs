@@ -27,7 +27,7 @@ pub async fn monitor_contacts<const N: usize, const M: usize>(
             let observed = mon_drv[i].is_high();
 
             if observed != (pattern & (1 << mapping[i]) != 0) {
-                defmt::error!("Tamper contact {} tripped", i);
+                crate::error!("Tamper contact {} tripped", i);
             }
         }
     }

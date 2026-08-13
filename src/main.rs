@@ -28,8 +28,6 @@ use embedded_io_async::{Read, Write};
 use static_cell::StaticCell;
 
 #[allow(unused_imports)]
-use ashen_fw::defmt_link as _;
-#[allow(unused_imports)]
 use ashen_fw::panic_link as _;
 
 #[global_allocator]
@@ -361,7 +359,7 @@ impl Read for SplitIo {
 impl Write for SplitIo {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
         if let Err(e) = self.tx.write(buf).await {
-            defmt::warn!("uart wr err {}", e);
+            ashen_fw::warn!("uart wr err {:?}", e);
             return Err(e);
         }
         Ok(buf.len())
@@ -453,7 +451,7 @@ async fn main(spawner: Spawner) {
             .run_session(&mut keystore)
             .await;
 
-        defmt::info!("session end: {}", defmt::Debug2Format(&end));
+        ashen_fw::info!("session end: {:?}", end);
 
         if let SessionEnd::Erased = end {
             // Discard boot/initial-handshake DMA events. The diagnostic log

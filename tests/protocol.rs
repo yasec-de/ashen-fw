@@ -10,6 +10,26 @@ use ashen_fw::protocol::{Message, SessionEnd};
 mod common;
 use common::{duplex_pair, rng};
 
+/// Receives the next non-[`Message::Log`] message.
+///
+/// The device forwards buffered log output over the same link, interleaved
+/// with protocol replies (see
+/// [`run_session`](ashen_fw::noise_link::NoiseLink::run_session)), so a test
+/// waiting for a specific reply has to step over any log messages that arrive
+/// first. Draining them here also keeps the duplex channel from backing up.
+#[allow(dead_code)]
+async fn receive_skipping_logs<T>(client: &mut NoiseLink<T>) -> Message
+where
+    T: embedded_io_async::Read + embedded_io_async::Write,
+{
+    loop {
+        match client.receive_msg().await.expect("receive message failed") {
+            Message::Log(_) => continue,
+            other => return other,
+        }
+    }
+}
+
 #[test]
 fn echo_request_replies_with_value_plus_one() {
     let server_keys = generate_keypair(rng(0x1234_5678)).unwrap();
@@ -47,7 +67,7 @@ fn echo_request_replies_with_value_plus_one() {
             .await
             .expect("send echo request failed");
 
-        let response = client.receive_msg().await.expect("receive echo response");
+        let response = receive_skipping_logs(&mut client).await;
         match response {
             Message::EchoResponse { value } => assert_eq!(value, 42),
             other => panic!("expected echo response, got {other:?}"),
@@ -74,7 +94,7 @@ fn send_log_message_round_trips() {
                 NoiseLink::responder_handshake_retry(ResetReader::new(server_io), &server_static, || rng(0xC0DE_C0DE), &mut keystore)
                     .await;
 
-            link.send_log_message(b"defmt frame bytes")
+            link.send_log_message(b"log output bytes")
                 .await
                 .expect("send log message failed");
 
@@ -98,7 +118,7 @@ fn send_log_message_round_trips() {
         let response = client.receive_msg().await.expect("receive log message");
         match response {
             Message::Log(data) => {
-                assert_eq!(data, b"defmt frame bytes");
+                assert_eq!(data, b"log output bytes");
             }
             other => panic!("expected log message, got {other:?}"),
         }

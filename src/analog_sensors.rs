@@ -369,7 +369,7 @@ pub async fn run_regular_monitor<const HALF: usize, const N: usize>(
         if rb.read(&mut buf).await.is_err() {
             // Fell behind the DMA; the next read restarts the stream. The
             // hardware watchdogs keep guarding VCC/temperature meanwhile.
-            defmt::warn!("analog_sensors: regular ADC ring-buffer overrun");
+            crate::warn!("analog_sensors: regular ADC ring-buffer overrun");
             continue;
         }
 
@@ -378,8 +378,8 @@ pub async fn run_regular_monitor<const HALF: usize, const N: usize>(
             for (j, limit) in limits.iter().enumerate() {
                 let mv = raw_to_mv(frame[1 + j], vdda_mv);
                 if mv < limit.min_mv || mv > limit.max_mv {
-                    defmt::panic!(
-                        "External ADC input {=str} out of range: {=u32} mV not within [{=u32}, {=u32}] mV",
+                    panic!(
+                        "External ADC input {} out of range: {} mV not within [{}, {}] mV",
                         limit.name,
                         mv,
                         limit.min_mv,
@@ -444,8 +444,8 @@ fn ADC1() {
     let vdda_mv = live_vdda_mv();
 
     if isr.awd1() {
-        defmt::panic!(
-            "VCC analog watchdog tripped: {=u32} mV not within [{=u32}, {=u32}] mV",
+        panic!(
+            "VCC analog watchdog tripped: {} mV not within [{}, {}] mV",
             vdda_mv,
             VCC_MIN_MV.load(Ordering::Relaxed),
             VCC_MAX_MV.load(Ordering::Relaxed),
@@ -454,8 +454,8 @@ fn ADC1() {
 
     if isr.awd2() {
         let temp_c = temperature_c(pac::ADC1.jdr(1).read().jdata(), vdda_mv);
-        defmt::panic!(
-            "Temperature analog watchdog tripped: {=i32} C not within [{=i32}, {=i32}] C",
+        panic!(
+            "Temperature analog watchdog tripped: {} C not within [{}, {}] C",
             temp_c,
             TEMP_MIN_C.load(Ordering::Relaxed),
             TEMP_MAX_C.load(Ordering::Relaxed),

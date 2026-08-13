@@ -4,10 +4,10 @@
 //! of the rest of the program (locks may be held, allocations may fail,
 //! peripherals may be mid-transaction). This module lets the application
 //! [`register`] a [`NoiseLink`] once its handshake has completed; on panic,
-//! the handler logs the panic via `defmt` (queueing a frame in
-//! [`crate::defmt_link`]) and makes a best-effort attempt to flush that
-//! queue to the host as [`Message::Log`](crate::protocol::Message)
-//! messages through it before halting. Flushing uses a fixed-size,
+//! the handler logs the panic via [`crate::log`] (writing it into the log
+//! pipe) and makes a best-effort attempt to flush that pipe to the host as
+//! [`Message::Log`](crate::protocol::Message) messages through it before
+//! halting. Flushing uses a fixed-size,
 //! non-allocating buffer so it cannot itself panic due to allocator failure;
 //! if it fails for any other reason (e.g. the transport is wedged, or the
 //! panic happened during a send/receive on the same link), the handler gives
@@ -22,12 +22,12 @@ use embedded_io_async::{Read, Write as IoWrite};
 
 use crate::noise_link::NoiseLink;
 
-/// Object-safe interface for flushing queued `defmt` log frames over a
+/// Object-safe interface for flushing buffered log output over a
 /// [`NoiseLink`] of any transport type.
 pub trait PanicReport: Send {
-    /// Flushes any `defmt` log frames queued by [`crate::defmt_link`]
-    /// (including the panic message just logged by the
-    /// `#[panic_handler]` in this module) to the host as
+    /// Flushes any log bytes buffered in [`crate::log`]'s pipe (including
+    /// the panic message just logged by the `#[panic_handler]` in this
+    /// module) to the host as
     /// [`Message::Log`](crate::protocol::Message) messages. Errors are
     /// ignored: this is a best-effort report made from a
     /// `#[panic_handler]`, where there is nothing more to do if it fails.
@@ -67,7 +67,7 @@ pub fn register(link: &'static mut dyn PanicReport) {
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    defmt::error!("panic: {}", defmt::Display2Format(info));
+    crate::error!("panic: {}", info);
 
     // Take the link out of `PANIC_LINK` (rather than borrowing it for the
     // duration of the flush) so that interrupts are re-enabled while

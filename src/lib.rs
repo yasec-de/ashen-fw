@@ -12,8 +12,7 @@ pub mod framing;
 // with a hand-rolled GPDMA circular buffer replacing the regular monitor.
 // #[cfg(target_os = "none")]
 // pub mod analog_sensors;
-#[cfg(target_os = "none")]
-pub mod defmt_link;
+pub mod log;
 #[cfg(target_os = "none")]
 pub mod flash_keystore;
 #[cfg(target_os = "none")]
