@@ -250,10 +250,10 @@ impl<T: Read + Write> NoiseLink<T> {
     pub async fn run_session<K: KeyStore>(&mut self, keystore: &mut K) -> SessionEnd {
         loop {
             // Real protocol messages always win: race an inbound message
-            // against "log output is available". Logs are only ever sent in
-            // the gaps when nothing is being received, and one chunk at a time,
-            // so a message queued mid-log-burst is serviced right after the
-            // current chunk rather than behind the whole backlog.
+            // against "log output is available". Backlogged logs are sent one
+            // chunk at a time in the gaps when nothing is being received, so a
+            // message queued mid-log-burst is serviced right after the current
+            // chunk rather than behind the whole backlog.
             match select(self.receive_msg(), crate::log::wait_readable()).await {
                 Either::First(result) => {
                     let result = match result {
@@ -264,6 +264,13 @@ impl<T: Read + Write> NoiseLink<T> {
                         Ok(Some(end)) => return end,
                         Ok(None) => {}
                         Err(e) => return SessionEnd::Error(e),
+                    }
+                    // Flush whatever the handler just logged before looping.
+                    // `select` polls the receive arm first, so a host that
+                    // pipelines its requests would otherwise win the race on
+                    // every iteration and starve the pipe indefinitely.
+                    if let Err(e) = self.flush_one_log().await {
+                        return SessionEnd::Error(e);
                     }
                 }
 
