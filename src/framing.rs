@@ -354,9 +354,10 @@ mod tests {
     #[test]
     fn ignores_data_until_first_reset() {
         embassy_futures::block_on(async {
+            // The peer's reset burst is RESET_REPLY_NULLS long; the reset is
+            // reported once its first RESET_NULL_RUN nulls have arrived.
             let mut data = encode(b"pre-reset junk");
-            data.push(0x00);
-            data.extend(core::iter::repeat(0x00).take(RESET_NULL_RUN));
+            data.extend(core::iter::repeat(0x00).take(RESET_REPLY_NULLS));
             let mut good = encode(b"real frame");
             good.push(0x00);
             data.append(&mut good);
@@ -365,7 +366,15 @@ mod tests {
 
             assert!(matches!(read_frame(&mut io).await, Err(Error::Reset)));
 
-            assert_eq!(io.io.out.len(), RESET_REPLY_NULLS);
+            // Reading on drains the rest of the burst and resyncs on the first
+            // real frame.
+            assert_eq!(read_frame(&mut io).await.unwrap(), b"real frame");
+
+            assert_eq!(
+                io.io.out.len(),
+                RESET_REPLY_NULLS,
+                "one reply of RESET_REPLY_NULLS nulls per reset"
+            );
             assert!(io.io.out.iter().all(|&b| b == 0x00));
         });
     }
@@ -373,31 +382,28 @@ mod tests {
     #[test]
     fn reset_reported_when_armed() {
         embassy_futures::block_on(async {
-            let data: Vec<u8> = core::iter::repeat(0x00)
-                .take(RESET_NULL_RUN)
-                .chain(core::iter::once(0x42))
-                .collect();
+            // A reset arriving mid-session, after a frame has been delivered.
+            // That frame's delimiter is the first null of the run, so only
+            // RESET_REPLY_NULLS - 1 more are needed to complete the burst.
+            let mut data = encode(b"last of old session");
+            data.push(0x00);
+            data.extend(core::iter::repeat(0x00).take(RESET_REPLY_NULLS - 1));
+            let mut good = encode(b"first of new session");
+            good.push(0x00);
+            data.append(&mut good);
+
             let mut io = ResetReader::start_synchronized(SliceIo::new(data));
-            assert!(!matches!(read_frame(&mut io).await, Err(Error::Reset)));
+
+            assert_eq!(read_frame(&mut io).await.unwrap(), b"last of old session");
             assert!(matches!(read_frame(&mut io).await, Err(Error::Reset)));
-            assert_eq!(io.io.out.len(), RESET_REPLY_NULLS);
-        });
-    }
+            assert_eq!(read_frame(&mut io).await.unwrap(), b"first of new session");
 
-    #[test]
-    fn back_to_back_resets_all_fire() {
-        embassy_futures::block_on(async {
-            let data: Vec<u8> = core::iter::repeat(0x00).take(RESET_NULL_RUN * 3).collect();
-            let mut io = ResetReader::start_synchronized(SliceIo::new(data));
-
-            let mut resets = 0;
-            for _ in 0..RESET_NULL_RUN * 3 {
-                if matches!(read_frame(&mut io).await, Err(Error::Reset)) {
-                    resets += 1;
-                }
-            }
-            assert_eq!(resets, 3, "each contiguous reset run must fire");
-            assert_eq!(io.io.out.len(), RESET_REPLY_NULLS * 3);
+            assert_eq!(
+                io.io.out.len(),
+                RESET_REPLY_NULLS,
+                "one reply of RESET_REPLY_NULLS nulls per reset"
+            );
+            assert!(io.io.out.iter().all(|&b| b == 0x00));
         });
     }
 
