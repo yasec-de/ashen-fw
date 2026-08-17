@@ -4,6 +4,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 
 use ashen_fw::flash_keystore::FlashKeyStore;
 use ashen_fw::framing::ResetReader;
@@ -79,6 +80,38 @@ fn boxed_hw_rng() -> Box<dyn Random> {
     Box::new(HwRng::new())
 }
 
+#[embassy_executor::task]
+async fn session_loop(
+    link: &'static mut Option<NoiseLink<&'static mut SplitIo>>,
+    mut keystore: FlashKeyStore<'static>,
+    local_private_key: Vec<u8>,
+) {
+    loop {
+        let end = link
+            .as_mut()
+            .expect("link is always present at the start of a session")
+            .run_session(&mut keystore)
+            .await;
+
+        ashen_fw::info!("session end: {:?}", end);
+
+        if let SessionEnd::Erased = end {
+            keystore.erase();
+        }
+
+        let io = link.take().expect("link present").into_io();
+        *link = Some(
+            NoiseLink::responder_handshake_retry(
+                io,
+                &local_private_key,
+                boxed_hw_rng,
+                &mut keystore,
+            )
+            .await,
+        );
+    }
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let mut config = embassy_stm32::Config::default();
@@ -141,28 +174,7 @@ async fn main(spawner: Spawner) {
         unsafe { &mut *(link as *mut _) };
     ashen_fw::panic_link::register(panic_link);
 
-    loop {
-        let end = link
-            .as_mut()
-            .expect("link is always present at the start of a session")
-            .run_session(&mut keystore)
-            .await;
-
-        ashen_fw::info!("session end: {:?}", end);
-
-        if let SessionEnd::Erased = end {
-            keystore.erase();
-        }
-
-        let io = link.take().expect("link present").into_io();
-        *link = Some(
-            NoiseLink::responder_handshake_retry(
-                io,
-                &local_keys.private,
-                boxed_hw_rng,
-                &mut keystore,
-            )
-            .await,
-        );
-    }
+    spawner.spawn(
+        session_loop(link, keystore, local_keys.private).expect("failed to spawn session task"),
+    );
 }
