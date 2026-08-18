@@ -67,6 +67,7 @@ use alloc::vec::Vec;
 use core::cell::{RefCell, Ref, RefMut, BorrowError, BorrowMutError};
 use core::mem::{self, MaybeUninit};
 use alloc::boxed::Box;
+use crate::info;
 
 type LiveCell<T> = RefCell<Box<MaybeUninit<T>>>;
 
@@ -110,13 +111,17 @@ pub async fn run() {
         for entry in REGISTRY.lock().await.iter_mut() {
             entry.remask().unwrap_or(());
         }
+        zeroize::zeroize_stack::<512>();
     }
 }
 
 impl<T> MaskedCell<T> {
     /// Constructor creating a new masked cell and registering its masking 
     /// store and metadata.
-    pub fn new(value: T) -> MaskedCell<T> {
+    pub fn new(value: T) -> MaskedCell<T>
+    where
+        T: Copy,
+    {
         let live: &'static LiveCell<T> =
             Box::leak(Box::new(RefCell::new(Box::new(MaybeUninit::new(value)))));
 
@@ -158,7 +163,7 @@ impl<T> Masker<T> {
     }
 }
 
-impl<T> Remask for Masker<T> {
+impl<T: Copy> Remask for Masker<T> {
     fn remask(&mut self) -> Result<(), BorrowMutError> {
         if self.parity < 0 {
             self.parity += 1;
@@ -177,7 +182,7 @@ impl<T> Remask for Masker<T> {
                 }
             };
 
-            mem::swap(&mut **live, &mut *self.masked);
+            *self.masked = **live;
             mem::swap(&mut *live, &mut self.masked);
 
             self.parity = -self.parity;
@@ -186,8 +191,9 @@ impl<T> Remask for Masker<T> {
         })?;
 
         for byte in self.masked.as_bytes_mut().iter_mut() {
+            let byte = byte.as_mut_ptr();
             unsafe {
-                byte.write(!byte.assume_init());
+                byte.write_volatile(!byte.read_volatile());
             }
         }
 

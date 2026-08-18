@@ -15,7 +15,7 @@ use core::cell::{Cell, RefCell};
 use core::fmt;
 
 use chacha20poly1305::aead::AeadInPlace;
-use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
+use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit};
 use curve25519_dalek::montgomery::MontgomeryPoint;
 use embedded_io_async::{Read, Write};
 use subtle::ConstantTimeEq;
@@ -24,6 +24,7 @@ use snow::resolvers::{CryptoResolver, DefaultResolver};
 use snow::types::{Cipher, Dh, Hash};
 pub use snow::types::Random;
 use snow::{Builder, TransportState};
+use zeroize::{Zeroizing, zeroize_stack};
 
 use crate::framing::{self, ResetReader};
 use crate::masked_memory::MaskedCell;
@@ -103,18 +104,18 @@ pub struct SecretKeys {
 
 impl SecretKeys {
     pub fn generate(mut rng: Box<dyn Random>) -> Result<(SecretKeys, [u8; KEY_LEN]), Error> {
-        let mut identity = [0u8; KEY_LEN];
-        rng.try_fill_bytes(&mut identity)?;
-        let public = MontgomeryPoint::mul_base_clamped(identity).to_bytes();
-        Ok((SecretKeys::from_identity(&identity), public))
+        let mut identity = Zeroizing::new([0u8; KEY_LEN]);
+        rng.try_fill_bytes(&mut identity[..])?;
+        let public = MontgomeryPoint::mul_base_clamped(*identity).to_bytes();
+        Ok((SecretKeys::from_identity(&identity[..]), public))
     }
 
     pub fn from_identity(identity: &[u8]) -> SecretKeys {
-        let mut key = [0u8; KEY_LEN];
+        let mut key = Zeroizing::new([0u8; KEY_LEN]);
         key.copy_from_slice(&identity[..KEY_LEN]);
 
         SecretKeys {
-            identity: MaskedCell::new(key),
+            identity: MaskedCell::new(*key),
             session: MaskedCell::new(SessionKeys {
                 cipher: [[0u8; KEY_LEN]; CIPHER_SLOTS],
                 dh: [[0u8; KEY_LEN]; DH_SLOTS],
@@ -124,9 +125,9 @@ impl SecretKeys {
 }
 
 pub fn generate_keypair(mut rng: Box<dyn Random>) -> Result<snow::Keypair, Error> {
-    let mut private = [0u8; KEY_LEN];
-    rng.try_fill_bytes(&mut private)?;
-    let public = MontgomeryPoint::mul_base_clamped(private).to_bytes();
+    let mut private = Zeroizing::new([0u8; KEY_LEN]);
+    rng.try_fill_bytes(&mut private[..])?;
+    let public = MontgomeryPoint::mul_base_clamped(*private).to_bytes();
 
     Ok(snow::Keypair {
         private: private.to_vec(),
@@ -164,8 +165,8 @@ impl Cipher for MaskedCipher {
         out[..plaintext.len()].copy_from_slice(plaintext);
 
         let tag = {
-            let keys = self.keys.borrow();
-            ChaCha20Poly1305::new(&keys.cipher[self.slot].into())
+            let key = Zeroizing::new(self.keys.borrow().cipher[self.slot]);
+            ChaCha20Poly1305::new(Key::from_slice(&key[..]))
                 .encrypt_in_place_detached(
                     &nonce_bytes.into(),
                     authtext,
@@ -191,8 +192,8 @@ impl Cipher for MaskedCipher {
         let message_len = ciphertext.len() - TAG_LEN;
         out[..message_len].copy_from_slice(&ciphertext[..message_len]);
 
-        let keys = self.keys.borrow();
-        ChaCha20Poly1305::new(&keys.cipher[self.slot].into())
+        let key = Zeroizing::new(self.keys.borrow().cipher[self.slot]);
+        ChaCha20Poly1305::new(Key::from_slice(&key[..]))
             .decrypt_in_place_detached(
                 &nonce_bytes.into(),
                 authtext,
@@ -220,8 +221,8 @@ unsafe impl Sync for MaskedDh {}
 
 impl MaskedDh {
     fn derive_pubkey(&mut self) {
-        let privkey = self.keys.borrow().dh[self.slot];
-        self.pubkey = MontgomeryPoint::mul_base_clamped(privkey).to_bytes();
+        let privkey = Zeroizing::new(self.keys.borrow().dh[self.slot]);
+        self.pubkey = MontgomeryPoint::mul_base_clamped(*privkey).to_bytes();
     }
 }
 
@@ -244,9 +245,9 @@ impl Dh for MaskedDh {
     }
 
     fn generate(&mut self, rng: &mut dyn Random) -> Result<(), snow::Error> {
-        let mut privkey = [0u8; KEY_LEN];
-        rng.try_fill_bytes(&mut privkey)?;
-        self.keys.borrow_mut().dh[self.slot] = privkey;
+        let mut privkey = Zeroizing::new([0u8; KEY_LEN]);
+        rng.try_fill_bytes(&mut privkey[..])?;
+        self.keys.borrow_mut().dh[self.slot] = *privkey;
         self.derive_pubkey();
         Ok(())
     }
@@ -267,11 +268,11 @@ impl Dh for MaskedDh {
         peer.copy_from_slice(&pubkey[..KEY_LEN]);
 
         let shared = {
-            let keys = self.keys.borrow();
-            MontgomeryPoint(peer).mul_clamped(keys.dh[self.slot]).to_bytes()
+            let privkey = Zeroizing::new(self.keys.borrow().dh[self.slot]);
+            Zeroizing::new(MontgomeryPoint(peer).mul_clamped(*privkey).to_bytes())
         };
 
-        out[..KEY_LEN].copy_from_slice(&shared);
+        out[..KEY_LEN].copy_from_slice(&shared[..]);
         Ok(())
     }
 }
@@ -374,7 +375,10 @@ impl<T: Read + Write> NoiseLink<T> {
         F: FnMut() -> Box<dyn Random>,
     {
         loop {
-            match Self::responder_handshake(io, keys, fresh_rng(), keystore).await {
+            let outcome = Self::responder_handshake(io, keys, fresh_rng(), keystore).await;
+            zeroize_stack::<2048>();
+
+            match outcome {
                 Ok(link) => return link,
                 Err((_e, returned_io)) => {
                     io = returned_io;
@@ -482,7 +486,9 @@ impl<T: Read + Write> NoiseLink<T> {
 
     pub async fn send(&mut self, payload: &[u8]) -> Result<(), Error> {
         let mut ciphertext = vec![0u8; payload.len() + TAG_LEN];
-        let len = self.transport.write_message(payload, &mut ciphertext)?;
+        let result = self.transport.write_message(payload, &mut ciphertext);
+        zeroize_stack::<1024>();
+        let len = result?;
         framing::write_frame(&mut self.io, &ciphertext[..len]).await?;
         Ok(())
     }
@@ -490,7 +496,9 @@ impl<T: Read + Write> NoiseLink<T> {
     pub async fn receive(&mut self) -> Result<Vec<u8>, Error> {
         let msg = framing::read_frame(&mut self.io).await?;
         let mut plaintext = vec![0u8; msg.len()];
-        let len = self.transport.read_message(&msg, &mut plaintext)?;
+        let result = self.transport.read_message(&msg, &mut plaintext);
+        zeroize_stack::<1024>();
+        let len = result?;
         plaintext.truncate(len);
         Ok(plaintext)
     }

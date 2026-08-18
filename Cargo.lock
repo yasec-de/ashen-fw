@@ -64,6 +64,7 @@ dependencies = [
  "verus_builtin",
  "verus_builtin_macros",
  "vstd",
+ "zeroize",
 ]
 
 [[package]]
