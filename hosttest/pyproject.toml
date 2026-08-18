@@ -1,5 +1,0 @@
-[project]
-name = "ashen-host"
-version = "0"
-requires-python = ">=3.11"
-dependencies = ["cobs", "noiseprotocol"]

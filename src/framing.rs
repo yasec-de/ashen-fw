@@ -106,11 +106,11 @@ impl<T: Read + Write> ResetReader<T> {
 
     #[cfg(any(test, feature = "test-util"))]
     pub async fn send_reset(&mut self) -> Result<(), Error> {
-        let reset = [0u8; RESET_NULL_RUN];
+        let reset = [0u8; RESET_REPLY_NULLS];
         self.io.write_all(&reset).await.map_err(|_| Error::Io)?;
 
         let mut seen = 0;
-        while seen < RESET_REPLY_NULLS {
+        while seen < RESET_NULL_RUN {
             if self.read_raw().await? == 0x00 {
                 seen += 1;
             } else {
