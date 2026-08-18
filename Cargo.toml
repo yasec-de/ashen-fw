@@ -29,6 +29,8 @@ verus_builtin_macros = "=0.0.0-2026-06-14-0213"
 embassy-futures = { version = "0.1.2" }
 subtle = { version = "2", default-features = false }
 snow = { version = "0.10.0", default-features = false, features = ["default-resolver", "use-curve25519", "use-chacha20poly1305", "use-sha2"] }
+chacha20poly1305 = { version = "0.10", default-features = false }
+curve25519-dalek = { version = "4.1.3", default-features = false }
 
 # Dependencies only used by the embedded firmware binary. Kept out of the
 # default dependency set so that `ashen_fw::noise_link` and its tests build

@@ -24,7 +24,6 @@ pub mod noise_link;
 #[cfg(target_os = "none")]
 pub mod panic_link;
 pub mod protocol;
-#[cfg(target_os = "none")]
 pub mod masked_memory;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_util;

@@ -4,12 +4,12 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
-use alloc::vec::Vec;
 
 use ashen_fw::flash_keystore::FlashKeyStore;
 use ashen_fw::framing::ResetReader;
 use ashen_fw::hw_rng::{self, HwRng};
-use ashen_fw::noise_link::{KeyStore, NoiseLink, Random, generate_keypair};
+use ashen_fw::masked_memory;
+use ashen_fw::noise_link::{KeyStore, NoiseLink, Random, SecretKeys};
 use ashen_fw::protocol::SessionEnd;
 use embassy_executor::Spawner;
 use embassy_stm32::bind_interrupts;
@@ -84,7 +84,7 @@ fn boxed_hw_rng() -> Box<dyn Random> {
 async fn session_loop(
     link: &'static mut Option<NoiseLink<&'static mut SplitIo>>,
     mut keystore: FlashKeyStore<'static>,
-    local_private_key: Vec<u8>,
+    keys: SecretKeys,
 ) {
     loop {
         let end = link
@@ -101,13 +101,7 @@ async fn session_loop(
 
         let io = link.take().expect("link present").into_io();
         *link = Some(
-            NoiseLink::responder_handshake_retry(
-                io,
-                &local_private_key,
-                boxed_hw_rng,
-                &mut keystore,
-            )
-            .await,
+            NoiseLink::responder_handshake_retry(io, keys, boxed_hw_rng, &mut keystore).await,
         );
     }
 }
@@ -133,12 +127,14 @@ async fn main(spawner: Spawner) {
     spawner.spawn(
         blink(Output::new(p.PH10, Level::High, Speed::Low)).expect("failed to spawn blink task"),
     );
+    spawner.spawn(masked_memory::run().expect("failed to spawn remasking task"));
 
     hw_rng::init(Rng::new(p.RNG, Irqs));
 
     let flash = Flash::new_blocking(p.FLASH);
     let mut keystore = FlashKeyStore::new(flash);
-    let local_keys = generate_keypair(boxed_hw_rng()).expect("local keypair generation failed");
+    let (keys, _local_public) =
+        SecretKeys::generate(boxed_hw_rng()).expect("local keypair generation failed");
 
     let mut usart_config = UsartConfig::default();
     usart_config.baudrate = 1_000_000;
@@ -162,8 +158,7 @@ async fn main(spawner: Spawner) {
     io.rx.start_uart();
     let io = ResetReader::new(io);
     let link =
-        NoiseLink::responder_handshake_retry(io, &local_keys.private, boxed_hw_rng, &mut keystore)
-            .await;
+        NoiseLink::responder_handshake_retry(io, keys, boxed_hw_rng, &mut keystore).await;
 
     static LINK: StaticCell<Option<NoiseLink<&'static mut SplitIo>>> = StaticCell::new();
     let link = LINK.init(Some(link));
@@ -175,6 +170,6 @@ async fn main(spawner: Spawner) {
     ashen_fw::panic_link::register(panic_link);
 
     spawner.spawn(
-        session_loop(link, keystore, local_keys.private).expect("failed to spawn session task"),
+        session_loop(link, keystore, keys).expect("failed to spawn session task"),
     );
 }

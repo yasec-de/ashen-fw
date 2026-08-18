@@ -59,6 +59,7 @@
  *  https://www.usenix.org/legacy/events/sec01/full_papers/gutmann/gutmann.pdf
  */
 
+#[cfg(target_os = "none")]
 use embassy_time::{Duration, Ticker};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
@@ -98,6 +99,7 @@ struct Masker<T: 'static> {
 unsafe impl<T> Send for Masker<T> {}
 
 /// Remasking task to be spawned by the user.
+#[cfg(target_os = "none")]
 #[embassy_executor::task]
 pub async fn run() {
     /* 1789 isn't just the year of the storming of the Bastille, it's also a nice prime number. Since we need take locks of the RefCell here, we don't want this task to run in perfect lockstep with other things. Having it occur at a prime-number millisecond interval is an easy way to make that less likely.

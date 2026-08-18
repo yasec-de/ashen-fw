@@ -3,7 +3,7 @@
 use std::thread;
 
 use ashen_fw::framing::ResetReader;
-use ashen_fw::noise_link::{KeyStore, NoiseLink, generate_keypair};
+use ashen_fw::noise_link::{KeyStore, NoiseLink, SecretKeys, generate_keypair};
 use ashen_fw::test_util::TestKeyStore;
 use ashen_fw::protocol::{Message, SessionEnd};
 
@@ -18,12 +18,15 @@ fn handshake_and_echo_round_trips() {
 
     let (client_io, server_io) = duplex_pair();
 
+    let client_secrets = SecretKeys::from_identity(&client_keys.private);
+
     let server_static = server_keys.private.clone();
     let server_thread = thread::spawn(move || {
         embassy_futures::block_on(async move {
+            let server_secrets = SecretKeys::from_identity(&server_static);
             let mut keystore = TestKeyStore::default();
             let mut link =
-                NoiseLink::responder_handshake_retry(ResetReader::new(server_io), &server_static, || rng(0x00C0_FFEE), &mut keystore)
+                NoiseLink::responder_handshake_retry(ResetReader::new(server_io), server_secrets, || rng(0x00C0_FFEE), &mut keystore)
                     .await;
 
             assert_eq!(keystore.trusted_key(), None);
@@ -42,7 +45,7 @@ fn handshake_and_echo_round_trips() {
     embassy_futures::block_on(async move {
         let mut client = NoiseLink::initiator_handshake(
             client_io,
-            &client_keys.private,
+            client_secrets,
             rng(0xDEAD_BEEF),
         )
         .await
@@ -79,7 +82,7 @@ fn handshake_rejects_mismatched_remote_static_key() {
 
     // The server's TOFU keystore persists across both connections.
     let mut server_keystore = TestKeyStore::default();
-    let server_static = server_keys.private.clone();
+    let server_secrets = SecretKeys::from_identity(&server_keys.private);
 
     // First connection: client A explicitly pairs, so the server commits and
     // trusts client A's static key.
@@ -90,7 +93,7 @@ fn handshake_rejects_mismatched_remote_static_key() {
             embassy_futures::block_on(async move {
                 let mut client = NoiseLink::initiator_handshake(
                     client_io,
-                    &client_a_static,
+                    SecretKeys::from_identity(&client_a_static),
                     rng(0xDEAD_BEEF),
                 )
                 .await
@@ -112,7 +115,7 @@ fn handshake_rejects_mismatched_remote_static_key() {
         embassy_futures::block_on(async {
             let mut link = NoiseLink::responder_handshake_retry(
                 ResetReader::new(server_io),
-                &server_static,
+                server_secrets,
                 || rng(0x00C0_FFEE),
                 &mut server_keystore,
             )
@@ -143,7 +146,7 @@ fn handshake_rejects_mismatched_remote_static_key() {
             embassy_futures::block_on(async move {
                 let _ = NoiseLink::initiator_handshake(
                     client_io,
-                    &client_b_static,
+                    SecretKeys::from_identity(&client_b_static),
                     rng(0x2468_ACE0),
                 )
                 .await;
@@ -153,7 +156,7 @@ fn handshake_rejects_mismatched_remote_static_key() {
         embassy_futures::block_on(async {
             let link = NoiseLink::responder_handshake_retry(
                 ResetReader::new(server_io),
-                &server_static,
+                server_secrets,
                 || rng(0x1357_9BDF),
                 &mut server_keystore,
             )
@@ -178,12 +181,15 @@ fn run_session_returns_error_on_disconnect() {
 
     let (client_io, server_io) = duplex_pair();
 
+    let client_secrets = SecretKeys::from_identity(&client_keys.private);
+
     let server_static = server_keys.private.clone();
     let server_thread = thread::spawn(move || {
         embassy_futures::block_on(async move {
+            let server_secrets = SecretKeys::from_identity(&server_static);
             let mut keystore = TestKeyStore::default();
             let mut link =
-                NoiseLink::responder_handshake_retry(ResetReader::new(server_io), &server_static, || rng(0xAAAA_AAAA), &mut keystore)
+                NoiseLink::responder_handshake_retry(ResetReader::new(server_io), server_secrets, || rng(0xAAAA_AAAA), &mut keystore)
                     .await;
 
             // The client sends one echo request, then drops its end of the
@@ -199,7 +205,7 @@ fn run_session_returns_error_on_disconnect() {
     embassy_futures::block_on(async move {
         let mut client = NoiseLink::initiator_handshake(
             client_io,
-            &client_keys.private,
+            client_secrets,
             rng(0xBBBB_BBBB),
         )
         .await

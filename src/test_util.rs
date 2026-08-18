@@ -7,7 +7,7 @@ use alloc::vec;
 use embedded_io_async::{Read, Write};
 
 use crate::framing::{self, ResetReader};
-use crate::noise_link::{Error, KeyStore, NoiseLink, Random, builder};
+use crate::noise_link::{Error, KeyStore, NoiseLink, Random, SecretKeys, builder};
 use crate::protocol::Message;
 
 /// PRNG for providing deterministic randomness during tests
@@ -71,7 +71,7 @@ impl KeyStore for TestKeyStore {
 impl<T: Read + Write> NoiseLink<T> {
     pub async fn initiator_handshake(
         io: T,
-        local_static_key: &[u8],
+        keys: SecretKeys,
         rng: Box<dyn Random>,
     ) -> Result<Self, Error> {
         let mut io = ResetReader::new(io);
@@ -80,9 +80,12 @@ impl<T: Read + Write> NoiseLink<T> {
         // consume its null reply before starting the handshake.
         io.send_reset().await?;
 
-        let mut hs = builder(rng)?
-            .local_private_key(local_static_key)?
-            .build_initiator()?;
+        let mut hs = {
+            let identity = keys.identity.borrow();
+            builder(rng, keys)?
+                .local_private_key(&identity[..])?
+                .build_initiator()?
+        };
 
         let mut buf = vec![0u8; framing::MAX_PAYLOAD_LEN];
 

@@ -3,7 +3,7 @@
 use std::thread;
 
 use ashen_fw::framing::ResetReader;
-use ashen_fw::noise_link::{KeyStore, NoiseLink, generate_keypair};
+use ashen_fw::noise_link::{KeyStore, NoiseLink, SecretKeys, generate_keypair};
 use ashen_fw::test_util::TestKeyStore;
 use ashen_fw::protocol::{Message, SessionEnd};
 
@@ -37,12 +37,13 @@ fn echo_request_replies_with_value_plus_one() {
 
     let (client_io, server_io) = duplex_pair();
 
+    let client_secrets = SecretKeys::from_identity(&client_keys.private);
     let server_static = server_keys.private.clone();
     let server_thread = thread::spawn(move || {
         embassy_futures::block_on(async move {
             let mut keystore = TestKeyStore::default();
             let mut link =
-                NoiseLink::responder_handshake_retry(ResetReader::new(server_io), &server_static, || rng(0x00C0_FFEE), &mut keystore)
+                NoiseLink::responder_handshake_retry(ResetReader::new(server_io), SecretKeys::from_identity(&server_static), || rng(0x00C0_FFEE), &mut keystore)
                     .await;
 
             match link.run_session(&mut keystore).await {
@@ -56,7 +57,7 @@ fn echo_request_replies_with_value_plus_one() {
     embassy_futures::block_on(async move {
         let mut client = NoiseLink::initiator_handshake(
             client_io,
-            &client_keys.private,
+            client_secrets,
             rng(0xDEAD_BEEF),
         )
         .await
@@ -86,12 +87,13 @@ fn send_log_message_round_trips() {
 
     let (client_io, server_io) = duplex_pair();
 
+    let client_secrets = SecretKeys::from_identity(&client_keys.private);
     let server_static = server_keys.private.clone();
     let server_thread = thread::spawn(move || {
         embassy_futures::block_on(async move {
             let mut keystore = TestKeyStore::default();
             let mut link =
-                NoiseLink::responder_handshake_retry(ResetReader::new(server_io), &server_static, || rng(0xC0DE_C0DE), &mut keystore)
+                NoiseLink::responder_handshake_retry(ResetReader::new(server_io), SecretKeys::from_identity(&server_static), || rng(0xC0DE_C0DE), &mut keystore)
                     .await;
 
             link.send_log_message(b"log output bytes")
@@ -109,7 +111,7 @@ fn send_log_message_round_trips() {
     embassy_futures::block_on(async move {
         let mut client = NoiseLink::initiator_handshake(
             client_io,
-            &client_keys.private,
+            client_secrets,
             rng(0xFEED_FACE),
         )
         .await
@@ -141,6 +143,7 @@ fn erase_request_ends_session_and_clears_keystore() {
 
     let (client_io, server_io) = duplex_pair();
 
+    let client_secrets = SecretKeys::from_identity(&client_keys.private);
     let server_static = server_keys.private.clone();
     let server_thread = thread::spawn(move || {
         embassy_futures::block_on(async move {
@@ -150,7 +153,7 @@ fn erase_request_ends_session_and_clears_keystore() {
             keystore.trust(client_public);
 
             let mut link =
-                NoiseLink::responder_handshake_retry(ResetReader::new(server_io), &server_static, || rng(0x00C0_FFEE), &mut keystore)
+                NoiseLink::responder_handshake_retry(ResetReader::new(server_io), SecretKeys::from_identity(&server_static), || rng(0x00C0_FFEE), &mut keystore)
                     .await;
 
             // The presented key matches the trusted one, so the peer is trusted.
@@ -173,7 +176,7 @@ fn erase_request_ends_session_and_clears_keystore() {
     embassy_futures::block_on(async move {
         let mut client = NoiseLink::initiator_handshake(
             client_io,
-            &client_keys.private,
+            client_secrets,
             rng(0xDEAD_BEEF),
         )
         .await
@@ -192,12 +195,13 @@ fn echo_request_overflow_panics() {
 
     let (client_io, server_io) = duplex_pair();
 
+    let client_secrets = SecretKeys::from_identity(&client_keys.private);
     let server_static = server_keys.private.clone();
     let server_thread = thread::spawn(move || {
         embassy_futures::block_on(async move {
             let mut keystore = TestKeyStore::default();
             let mut link =
-                NoiseLink::responder_handshake_retry(ResetReader::new(server_io), &server_static, || rng(0xAAAA_AAAA), &mut keystore)
+                NoiseLink::responder_handshake_retry(ResetReader::new(server_io), SecretKeys::from_identity(&server_static), || rng(0xAAAA_AAAA), &mut keystore)
                     .await;
 
             // Should panic on overflow rather than wrap or return an error.
@@ -208,7 +212,7 @@ fn echo_request_overflow_panics() {
     embassy_futures::block_on(async move {
         let mut client = NoiseLink::initiator_handshake(
             client_io,
-            &client_keys.private,
+            client_secrets,
             rng(0xBBBB_BBBB),
         )
         .await
