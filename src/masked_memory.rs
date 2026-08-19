@@ -67,7 +67,6 @@ use alloc::vec::Vec;
 use core::cell::{RefCell, Ref, RefMut, BorrowError, BorrowMutError};
 use core::mem::{self, MaybeUninit};
 use alloc::boxed::Box;
-use crate::info;
 
 type LiveCell<T> = RefCell<Box<MaybeUninit<T>>>;
 

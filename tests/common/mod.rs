@@ -1,8 +1,18 @@
 //! Shared host-side test infrastructure.
 
+use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
+use ashen_fw::noise_link::SecretKeys;
+
 pub use ashen_fw::test_util::rng;
+
+pub fn secret_keys(identity: &[u8]) -> SecretKeys {
+    static INIT: Mutex<()> = Mutex::new(());
+
+    let _guard = INIT.lock().unwrap_or_else(|err| err.into_inner());
+    SecretKeys::from_identity(identity)
+}
 
 /// A byte-oriented duplex pipe built from two `mpsc` channels, implementing
 /// the `embedded-io` traits used by [`SecureLink`].
