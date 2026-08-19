@@ -170,25 +170,22 @@ impl<T: Copy> Remask for Masker<T> {
             return Ok(());
         }
 
-        critical_section::with(|_| {
-            let mut live = match self.live.try_borrow_mut() {
-                Ok(guard) => guard,
-                Err(err) => {
-                    self.parity += 1;
-                    if self.parity > 3600 {
-                        panic!("Memory remanence countermeasure parity out of bounds");
-                    }
-                    return Err(err);
-                }
-            };
+        let result = critical_section::with(|_| {
+            let mut live = self.live.try_borrow_mut()?;
 
             *self.masked = **live;
             mem::swap(&mut *live, &mut self.masked);
-
             self.parity = -self.parity;
-
             Ok(())
-        })?;
+        });
+
+        if let Err(err) = result {
+            self.parity += 1;
+            if self.parity > 3600 {
+                panic!("Memory remanence countermeasure parity out of bounds");
+            }
+            return Err(err);
+        }
 
         for byte in self.masked.as_bytes_mut().iter_mut() {
             let byte = byte.as_mut_ptr();
