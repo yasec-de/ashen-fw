@@ -193,7 +193,32 @@ impl<T: Copy> Remask for Masker<T> {
                 byte.write_volatile(!byte.read_volatile());
             }
         }
-
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remask_leaves_the_complement_in_the_stale_buffer() {
+        let value = [0xDEu8, 0xAD, 0xBE, 0xEF];
+        let complement = value.map(|byte| !byte);
+
+        let live: &'static LiveCell<[u8; 4]> =
+            Box::leak(Box::new(RefCell::new(Box::new(MaybeUninit::new(value)))));
+        let mut masker = Masker::new(live);
+        let mut previous = live.borrow().as_ptr();
+
+        for _ in 0..4 {
+            masker.remask().unwrap();
+
+            assert_eq!(unsafe { *live.borrow().assume_init_ref() }, value);
+            assert_eq!(unsafe { *masker.masked.assume_init_ref() }, complement);
+            assert_ne!(live.borrow().as_ptr(), previous);
+
+            previous = live.borrow().as_ptr();
+        }
     }
 }
