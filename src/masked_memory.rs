@@ -118,12 +118,12 @@ pub async fn run() {
 impl<T> MaskedCell<T> {
     /// Constructor creating a new masked cell and registering its masking 
     /// store and metadata.
-    pub fn new(value: T) -> MaskedCell<T>
+    pub fn new() -> MaskedCell<T>
     where
-        T: Copy,
+        T: Copy + Default,
     {
         let live: &'static LiveCell<T> =
-            Box::leak(Box::new(RefCell::new(Box::new(MaybeUninit::new(value)))));
+            Box::leak(Box::new(RefCell::new(Box::new(MaybeUninit::new(T::default())))));
 
         REGISTRY.try_lock().expect("MaskedCell::new called while registry busy").push(Box::new(Masker::new(live)));
 

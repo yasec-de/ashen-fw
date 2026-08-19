@@ -85,7 +85,7 @@ pub trait KeyStore {
 /// The per-handshake private key material snow asks its resolver for. Kept in
 /// one [`MaskedCell`] so that a re-handshake reuses the registration instead of
 /// adding another one.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub(crate) struct SessionKeys {
     cipher: [[u8; KEY_LEN]; CIPHER_SLOTS],
     dh: [[u8; KEY_LEN]; DH_SLOTS],
@@ -104,23 +104,31 @@ pub struct SecretKeys {
 
 impl SecretKeys {
     pub fn generate(mut rng: Box<dyn Random>) -> Result<(SecretKeys, [u8; KEY_LEN]), Error> {
-        let mut identity = Zeroizing::new([0u8; KEY_LEN]);
-        rng.try_fill_bytes(&mut identity[..])?;
-        let public = MontgomeryPoint::mul_base_clamped(*identity).to_bytes();
-        Ok((SecretKeys::from_identity(&identity[..]), public))
+        let keys = SecretKeys {
+            identity: MaskedCell::new(),
+            session: MaskedCell::new(),
+        };
+
+        let public = {
+            let mut identity = keys.identity.borrow_mut();
+            rng.try_fill_bytes(&mut identity[..])?;
+            MontgomeryPoint::mul_base_clamped(*identity).to_bytes()
+        };
+
+        Ok((keys, public))
     }
 
     pub fn from_identity(identity: &[u8]) -> SecretKeys {
-        let mut key = Zeroizing::new([0u8; KEY_LEN]);
-        key.copy_from_slice(&identity[..KEY_LEN]);
+        let keys = SecretKeys {
+            identity: MaskedCell::new(),
+            session: MaskedCell::new(),
+        };
 
-        SecretKeys {
-            identity: MaskedCell::new(*key),
-            session: MaskedCell::new(SessionKeys {
-                cipher: [[0u8; KEY_LEN]; CIPHER_SLOTS],
-                dh: [[0u8; KEY_LEN]; DH_SLOTS],
-            }),
-        }
+        keys.identity
+            .borrow_mut()
+            .copy_from_slice(&identity[..KEY_LEN]);
+
+        keys
     }
 }
 
