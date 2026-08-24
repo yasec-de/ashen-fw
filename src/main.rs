@@ -154,7 +154,7 @@ async fn link_bootstrap(p: LinkPeripherals) {
         SecretKeys::generate(boxed_hw_rng()).expect("local keypair generation failed");
 
     let mut usart_config = UsartConfig::default();
-    usart_config.baudrate = 1_000_000;
+    usart_config.baudrate = 4_000_000;
     let uart = Uart::new(
         p.lpuart,
         p.tx_pin,

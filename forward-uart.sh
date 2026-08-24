@@ -3,7 +3,7 @@
 # socket. Stays in the foreground until Ctrl-C, then restores arduino-router.
 set -e
 
-BAUD=${BAUD:-1000000}
+BAUD=${BAUD:-4000000}
 DEV=${DEV:-/dev/ttyHS1}
 PORT=${PORT:-7600}
 BOOT_GPIO=${BOOT_GPIO:-70}
