@@ -1,5 +1,22 @@
 pub mod c_heap;
+pub mod ffi;
 pub mod masked_slots;
+
+pub use ffi::{Error, init, process, reinit, reset_client, shutdown, version};
+
+#[cfg(target_os = "none")]
+#[unsafe(no_mangle)]
+pub extern "C" fn ashen_now_ms() -> u64 {
+    embassy_time::Instant::now().as_millis()
+}
+
+#[cfg(not(target_os = "none"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn ashen_now_ms() -> u64 {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static CLOCK: AtomicU64 = AtomicU64::new(0);
+    CLOCK.fetch_add(1, Ordering::Relaxed)
+}
 
 #[cfg(target_os = "none")]
 pub fn seed_entropy(dest: &mut [u8]) -> Result<(), ()> {

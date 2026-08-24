@@ -27,6 +27,7 @@ const WOLFCRYPT_SOURCES: &[&str] = &[
 ];
 
 const WOLFTPM_SOURCES: &[&str] = &[
+    "src/tpm2_crypto.c",
     "src/fwtpm/fwtpm.c",
     "src/fwtpm/fwtpm_command.c",
     "src/fwtpm/fwtpm_crypto.c",
@@ -84,7 +85,13 @@ fn build_tpm() {
         .opt_level(2);
 
     if bare_metal {
-        build.flag("-ffreestanding").flag("--specs=nano.specs");
+        build
+            .flag("-ffreestanding")
+            .flag("--specs=nano.specs")
+            // cc passes a bare -march=armv8-m.main, which lacks the DSP
+            // instructions (umaal) that wolfCrypt's sp_cortexm.c assembly
+            // uses. -march wins over -mcpu in gcc, so override the arch.
+            .flag("-march=armv8-m.main+dsp+fp");
     } else {
         build.define("ASHEN_HOST_BUILD", None);
     }
@@ -92,10 +99,18 @@ fn build_tpm() {
     for src in WOLFCRYPT_SOURCES {
         build.file(wolfssl.join("wolfcrypt/src").join(src));
     }
+    // Single-precision ECC needs its per-architecture implementation: the
+    // Cortex-M assembly version on target, the portable C one on the host.
+    build.file(wolfssl.join("wolfcrypt/src").join(if bare_metal {
+        "sp_cortexm.c"
+    } else {
+        "sp_c32.c"
+    }));
     for src in WOLFTPM_SOURCES {
         build.file(wolftpm.join(src));
     }
     build.file(csrc.join("shim.c"));
+    build.file(csrc.join("tpm_glue.c"));
 
     build.compile("ashen_tpm");
 }
