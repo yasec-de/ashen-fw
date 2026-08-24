@@ -25,5 +25,6 @@ pub mod noise_link;
 pub mod panic_link;
 pub mod protocol;
 pub mod masked_memory;
+pub mod tpm;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_util;
