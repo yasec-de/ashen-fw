@@ -4,6 +4,8 @@
   rust-bin,
   rust-analyzer,
   probe-rs-tools,
+  gcc-arm-embedded,
+  stdenv,
 }:
 let
   cargoToml = builtins.fromTOML (builtins.readFile ../../Cargo.toml);
@@ -38,10 +40,15 @@ rustPlatform.buildRustPackage {
   nativeBuildInputs = [
     rust-analyzer
     probe-rs-tools
+    gcc-arm-embedded
   ];
 
   # Disable auditable for embedded targets (doesn't work with rust-lld)
   auditable = false;
+
+  CC_thumbv8m_main_none_eabihf = "arm-none-eabi-gcc";
+  AR_thumbv8m_main_none_eabihf = "arm-none-eabi-ar";
+  CC_x86_64_unknown_linux_gnu = "${stdenv.cc}/bin/cc";
 
   buildPhase = ''
     runHook preBuild

@@ -1,3 +1,6 @@
 [target.'cfg(all(target_arch = "arm", target_os = "none"))']
 runner = "probe-rs run --chip STM32U585AI --connect-under-reset --protocol swd --speed 1000"
 
+[env]
+CC_thumbv8m_main_none_eabihf = "arm-none-eabi-gcc"
+AR_thumbv8m_main_none_eabihf = "arm-none-eabi-ar"
