@@ -39,7 +39,7 @@ emballoc = "0.3.0"
 # and run for the host architecture.
 [target.'cfg(target_os = "none")'.dependencies]
 embassy-stm32 = { version = "0.6.0", features = ["stm32u585ai", "unstable-pac", "time-driver-any", "exti", "memory-x"]  }
-embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread"] }
+embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread", "executor-interrupt"] }
 embassy-time = { version = "0.5.1", features = ["tick-hz-32_768"] }
 
 cortex-m = { version = "0.7.7", features = ["inline-asm", "critical-section-single-core"] }

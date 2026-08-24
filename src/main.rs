@@ -11,8 +11,11 @@ use ashen_fw::hw_rng::{self, HwRng};
 use ashen_fw::masked_memory;
 use ashen_fw::noise_link::{KeyStore, NoiseLink, Random, SecretKeys};
 use ashen_fw::protocol::SessionEnd;
-use embassy_executor::Spawner;
-use embassy_stm32::bind_interrupts;
+use ashen_fw::tpm;
+use embassy_executor::{InterruptExecutor, Spawner};
+use embassy_stm32::interrupt;
+use embassy_stm32::interrupt::{InterruptExt, Priority};
+use embassy_stm32::{Peri, bind_interrupts, peripherals};
 use embassy_stm32::flash::Flash;
 use embassy_stm32::gpio::{Level, Output, Speed};
 use embassy_stm32::mode::Async;
@@ -27,7 +30,7 @@ use static_cell::StaticCell;
 use ashen_fw::panic_link as _;
 
 #[global_allocator]
-static ALLOCATOR: emballoc::Allocator<4096> = emballoc::Allocator::new();
+static ALLOCATOR: emballoc::Allocator<65536> = emballoc::Allocator::new();
 
 bind_interrupts!(struct Irqs {
     LPUART1 => embassy_stm32::usart::InterruptHandler<LPUART1>;
@@ -38,6 +41,13 @@ bind_interrupts!(struct Irqs {
 
 /// Size of the LPUART1 DMA RX ring buffer.
 const UART_BUF_LEN: usize = 256;
+
+static EXECUTOR_HIGH: InterruptExecutor = InterruptExecutor::new();
+
+#[interrupt]
+unsafe fn UART5() {
+    unsafe { EXECUTOR_HIGH.on_interrupt() }
+}
 
 struct SplitIo {
     rx: RingBufferedUartRx<'static>,
@@ -97,6 +107,11 @@ async fn session_loop(
 
         if let SessionEnd::Erased = end {
             keystore.erase();
+            if let Err(e) = tpm::reinit() {
+                ashen_fw::warn!("TPM re-manufacture after erase failed: {:?}", e);
+            }
+        } else {
+            tpm::reset_client();
         }
 
         let io = link.take().expect("link present").into_io();
@@ -104,6 +119,73 @@ async fn session_loop(
             NoiseLink::responder_handshake_retry(io, keys, boxed_hw_rng, &mut keystore).await,
         );
     }
+}
+
+struct LinkPeripherals {
+    led: Peri<'static, peripherals::PH10>,
+    lpuart: Peri<'static, peripherals::LPUART1>,
+    tx_pin: Peri<'static, peripherals::PG8>,
+    rx_pin: Peri<'static, peripherals::PG7>,
+    dma_tx: Peri<'static, peripherals::GPDMA1_CH1>,
+    dma_rx: Peri<'static, peripherals::GPDMA1_CH2>,
+    flash: Peri<'static, peripherals::FLASH>,
+}
+
+/// Send-safe entry point for [`EXECUTOR_HIGH`]: everything it spawns from here
+/// on goes through a local `Spawner`, which has no `Send` bound.
+#[embassy_executor::task]
+async fn high_prio_init(p: LinkPeripherals) {
+    let spawner = unsafe { Spawner::for_current_executor() }.await;
+    spawner.spawn(masked_memory::run().expect("failed to spawn remasking task"));
+    spawner.spawn(link_bootstrap(p).expect("failed to spawn link bootstrap task"));
+}
+
+#[embassy_executor::task]
+async fn link_bootstrap(p: LinkPeripherals) {
+    let spawner = unsafe { Spawner::for_current_executor() }.await;
+
+    spawner.spawn(
+        blink(Output::new(p.led, Level::High, Speed::Low)).expect("failed to spawn blink task"),
+    );
+
+    let flash = Flash::new_blocking(p.flash);
+    let mut keystore = FlashKeyStore::new(flash);
+    let (keys, _local_public) =
+        SecretKeys::generate(boxed_hw_rng()).expect("local keypair generation failed");
+
+    let mut usart_config = UsartConfig::default();
+    usart_config.baudrate = 1_000_000;
+    let uart = Uart::new(
+        p.lpuart,
+        p.tx_pin,
+        p.rx_pin,
+        p.dma_tx,
+        p.dma_rx,
+        Irqs,
+        usart_config,
+    )
+    .expect("LPUART1 init failed");
+    let (tx, rx) = uart.split();
+
+    static RX_BUF: StaticCell<[u8; UART_BUF_LEN]> = StaticCell::new();
+    let rx = rx.into_ring_buffered(RX_BUF.init([0; UART_BUF_LEN]));
+
+    static IO: StaticCell<SplitIo> = StaticCell::new();
+    let io = IO.init(SplitIo { rx, tx });
+    io.rx.start_uart();
+    let io = ResetReader::new(io);
+    let link = NoiseLink::responder_handshake_retry(io, keys, boxed_hw_rng, &mut keystore).await;
+
+    static LINK: StaticCell<Option<NoiseLink<&'static mut SplitIo>>> = StaticCell::new();
+    let link = LINK.init(Some(link));
+
+    // SAFETY: this creates a second `&'static mut` alias of `link`, used
+    // only by the panic handler.
+    let panic_link: &'static mut Option<NoiseLink<&'static mut SplitIo>> =
+        unsafe { &mut *(link as *mut _) };
+    ashen_fw::panic_link::register(panic_link);
+
+    spawner.spawn(session_loop(link, keystore, keys).expect("failed to spawn session task"));
 }
 
 #[embassy_executor::main]
@@ -124,52 +206,24 @@ async fn main(spawner: Spawner) {
         config.rcc.voltage_range = VoltageScale::RANGE1; // required above 110 MHz
     }
     let p = embassy_stm32::init(config);
-    spawner.spawn(
-        blink(Output::new(p.PH10, Level::High, Speed::Low)).expect("failed to spawn blink task"),
-    );
-    spawner.spawn(masked_memory::run().expect("failed to spawn remasking task"));
 
     hw_rng::init(Rng::new(p.RNG, Irqs));
+    tpm::init().expect("fwTPM initialisation failed");
 
-    let flash = Flash::new_blocking(p.FLASH);
-    let mut keystore = FlashKeyStore::new(flash);
-    let (keys, _local_public) =
-        SecretKeys::generate(boxed_hw_rng()).expect("local keypair generation failed");
+    spawner.spawn(tpm::task().expect("failed to spawn TPM task"));
 
-    let mut usart_config = UsartConfig::default();
-    usart_config.baudrate = 1_000_000;
-    let uart = Uart::new(
-        p.LPUART1,
-        p.PG8,
-        p.PG7,
-        p.GPDMA1_CH1,
-        p.GPDMA1_CH2,
-        Irqs,
-        usart_config,
-    )
-    .expect("LPUART1 init failed");
-    let (tx, rx) = uart.split();
-
-    static RX_BUF: StaticCell<[u8; UART_BUF_LEN]> = StaticCell::new();
-    let rx = rx.into_ring_buffered(RX_BUF.init([0; UART_BUF_LEN]));
-
-    static IO: StaticCell<SplitIo> = StaticCell::new();
-    let io = IO.init(SplitIo { rx, tx });
-    io.rx.start_uart();
-    let io = ResetReader::new(io);
-    let link =
-        NoiseLink::responder_handshake_retry(io, keys, boxed_hw_rng, &mut keystore).await;
-
-    static LINK: StaticCell<Option<NoiseLink<&'static mut SplitIo>>> = StaticCell::new();
-    let link = LINK.init(Some(link));
-
-    // SAFETY: this creates a second `&'static mut` alias of `link`, used
-    // only by the panic handler.
-    let panic_link: &'static mut Option<NoiseLink<&'static mut SplitIo>> =
-        unsafe { &mut *(link as *mut _) };
-    ashen_fw::panic_link::register(panic_link);
-
-    spawner.spawn(
-        session_loop(link, keystore, keys).expect("failed to spawn session task"),
+    interrupt::UART5.set_priority(Priority::P6);
+    let high = EXECUTOR_HIGH.start(interrupt::UART5);
+    high.spawn(
+        high_prio_init(LinkPeripherals {
+            led: p.PH10,
+            lpuart: p.LPUART1,
+            tx_pin: p.PG8,
+            rx_pin: p.PG7,
+            dma_tx: p.GPDMA1_CH1,
+            dma_rx: p.GPDMA1_CH2,
+            flash: p.FLASH,
+        })
+        .expect("failed to spawn high priority init task"),
     );
 }
