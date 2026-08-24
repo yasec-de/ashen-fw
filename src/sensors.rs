@@ -17,7 +17,7 @@ pub async fn monitor_contacts<const N: usize, const M: usize>(
     let mut rng = HwRng::new();
 
     loop {
-        let pattern = rng.read_word().await;
+        let pattern = rng.read_word();
         for i in 0..N {
             stim_drv[i].set_level((pattern & (1 << i) != 0).into());
         }

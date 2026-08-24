@@ -3,9 +3,8 @@ pub mod masked_slots;
 
 #[cfg(target_os = "none")]
 pub fn seed_entropy(dest: &mut [u8]) -> Result<(), ()> {
-    use crate::noise_link::Random;
-    let mut rng = crate::hw_rng::HwRng::new();
-    rng.try_fill_bytes(dest).map_err(|_| ())
+    crate::hw_rng::fill_bytes(dest);
+    Ok(())
 }
 
 /// Host stand-in for the STM32 TRNG. Deterministic on purpose: the host build
