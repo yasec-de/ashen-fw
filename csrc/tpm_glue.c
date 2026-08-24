@@ -14,6 +14,21 @@ extern int ashen_nv_read(word32 offset, byte* buf, word32 len);
 extern int ashen_nv_write(word32 offset, const byte* buf, word32 len);
 extern int ashen_nv_fill(word32 offset, word32 len, byte value);
 
+/* Masked secret slots, implemented on the Rust side over MaskedCell. The
+ * handle numbering must match src/tpm/masked_slots.rs. */
+extern byte* ashen_masked_acquire(word32 handle);
+extern void  ashen_masked_release(word32 handle);
+
+byte* FWTPM_MaskedAcquire(word32 handle)
+{
+    return ashen_masked_acquire(handle);
+}
+
+void FWTPM_MaskedRelease(word32 handle)
+{
+    ashen_masked_release(handle);
+}
+
 static FWTPM_CTX  g_ctx;
 static int        g_ready;
 

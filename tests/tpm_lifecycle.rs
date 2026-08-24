@@ -142,4 +142,17 @@ fn teardown_keeps_the_identity_and_erase_replaces_it() {
         ek, ek_after_erase,
         "the endorsement key survived an erase"
     );
+
+    // The seeds live in MaskedCells, so their backing buffers move under the
+    // TPM between commands. Derivation must be unaffected.
+    for _ in 0..4 {
+        ashen_fw::masked_memory::remask_once();
+        // FWTPM_MAX_OBJECTS is 3; free the previous primary before loading one.
+        tpm::reset_client();
+        let (_, ek_after_remask) = create_endorsement_primary();
+        assert_eq!(
+            ek_after_erase, ek_after_remask,
+            "remasking changed the endorsement key"
+        );
+    }
 }
