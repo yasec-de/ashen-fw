@@ -114,8 +114,24 @@ pub async fn run() {
     }
 }
 
+/// Runs one remasking cycle synchronously and reports how many registered
+/// cells actually swapped. Cells that are currently borrowed are skipped, so
+/// a return value below the registry length means something held a ref.
+#[cfg(any(test, feature = "test-util"))]
+pub fn remask_once() -> usize {
+    let mut swapped = 0;
+    if let Ok(mut registry) = REGISTRY.try_lock() {
+        for entry in registry.iter_mut() {
+            if entry.remask().is_ok() {
+                swapped += 1;
+            }
+        }
+    }
+    swapped
+}
+
 impl<T> MaskedCell<T> {
-    /// Constructor creating a new masked cell and registering its masking 
+    /// Constructor creating a new masked cell and registering its masking
     /// store and metadata.
     pub fn new() -> MaskedCell<T>
     where
@@ -146,6 +162,16 @@ impl<T> MaskedCell<T> {
     }
 
     pub fn try_borrow_mut(&self) -> Result<RefMut<'_, T>, BorrowMutError> {
+        Ok(RefMut::map(self.live.try_borrow_mut()?, |live| unsafe {
+            live.assume_init_mut()
+        }))
+    }
+
+    /// Like [`Self::try_borrow_mut`], but the guard is not tied to the
+    /// borrow of `self`, so it can be parked somewhere and dropped later.
+    /// The cell is skipped by the remasking task for as long as the guard
+    /// lives, which is what keeps the address stable across a C call.
+    pub fn try_borrow_mut_static(self) -> Result<RefMut<'static, T>, BorrowMutError> {
         Ok(RefMut::map(self.live.try_borrow_mut()?, |live| unsafe {
             live.assume_init_mut()
         }))

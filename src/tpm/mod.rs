@@ -1,4 +1,5 @@
 pub mod c_heap;
+pub mod masked_slots;
 
 #[cfg(target_os = "none")]
 pub fn seed_entropy(dest: &mut [u8]) -> Result<(), ()> {
