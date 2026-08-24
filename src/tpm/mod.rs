@@ -2,7 +2,51 @@ pub mod c_heap;
 pub mod ffi;
 pub mod masked_slots;
 
-pub use ffi::{Error, init, process, reinit, reset_client, shutdown, version};
+pub use ffi::{Error, init, max_command_size, process, reinit, reset_client, shutdown, version};
+
+/// Runs one TPM command on behalf of a session.
+///
+/// On the firmware this hands the command to [`task`], which runs on the
+/// low-priority thread-mode executor, and awaits the reply — so a
+/// hundred-millisecond key generation cannot stall the link, the log pipe or
+/// the heartbeat, which all live on a higher-priority executor. On the host
+/// there is only one executor, so it calls straight through.
+#[cfg(target_os = "none")]
+pub async fn dispatch(cmd: &[u8]) -> Result<alloc::vec::Vec<u8>, Error> {
+    channel::COMMANDS.send(cmd.into()).await;
+    channel::RESPONSES.receive().await
+}
+
+#[cfg(not(target_os = "none"))]
+pub async fn dispatch(cmd: &[u8]) -> Result<alloc::vec::Vec<u8>, Error> {
+    process(cmd)
+}
+
+#[cfg(target_os = "none")]
+mod channel {
+    use alloc::vec::Vec;
+
+    use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+    use embassy_sync::channel::Channel;
+
+    use super::Error;
+
+    pub(super) static COMMANDS: Channel<CriticalSectionRawMutex, Vec<u8>, 1> = Channel::new();
+    pub(super) static RESPONSES: Channel<CriticalSectionRawMutex, Result<Vec<u8>, Error>, 1> =
+        Channel::new();
+}
+
+/// Serves TPM commands. Spawn on the low-priority executor; the blocking C
+/// call inside must be preemptible by the link tasks.
+#[cfg(target_os = "none")]
+#[embassy_executor::task]
+pub async fn task() {
+    loop {
+        let cmd = channel::COMMANDS.receive().await;
+        let result = process(&cmd);
+        channel::RESPONSES.send(result).await;
+    }
+}
 
 #[cfg(target_os = "none")]
 #[unsafe(no_mangle)]

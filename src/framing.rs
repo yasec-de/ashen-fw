@@ -8,7 +8,7 @@ pub use crate::cobs::{Error, decode, encode};
 
 pub const RESET_NULL_RUN: usize = 24;
 pub const RESET_REPLY_NULLS: usize = 32;
-pub const MAX_PAYLOAD_LEN: usize = 256;
+pub const MAX_PAYLOAD_LEN: usize = 512;
 pub const MAX_FRAME_LEN: usize = MAX_PAYLOAD_LEN + MAX_PAYLOAD_LEN / 254 + 2;
 const RX_CHUNK_LEN: usize = 256;
 

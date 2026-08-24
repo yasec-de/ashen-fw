@@ -53,19 +53,25 @@ fn run(cc: u32, params: &[u8]) -> Response {
     parse(&rsp)
 }
 
-fn boot() {
+/// The TPM core is a process-wide singleton with no internal locking, so tests
+/// that drive it take turns.
+static TPM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn boot() -> std::sync::MutexGuard<'static, ()> {
     use std::sync::Once;
     static ONCE: Once = Once::new();
+    let guard = TPM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     ONCE.call_once(|| {
         tpm::init().expect("fwTPM failed to initialise");
         let startup = run(CC_STARTUP, &SU_CLEAR.to_be_bytes());
         assert_eq!(startup.code, RC_SUCCESS, "TPM2_Startup failed");
     });
+    guard
 }
 
 #[test]
 fn reports_a_version_and_a_sane_context_size() {
-    boot();
+    let _serial = boot();
     assert!(!tpm::version().is_empty());
     // If the FFI were mislinked this would be zero or absurd.
     assert!(tpm::ffi::context_size() > 4096);
@@ -74,7 +80,7 @@ fn reports_a_version_and_a_sane_context_size() {
 
 #[test]
 fn self_test_passes() {
-    boot();
+    let _serial = boot();
     // fullTest = NO: run only what has not been tested yet.
     let rsp = run(CC_SELF_TEST, &[0u8]);
     assert_eq!(rsp.code, RC_SUCCESS, "TPM2_SelfTest failed");
@@ -82,7 +88,7 @@ fn self_test_passes() {
 
 #[test]
 fn get_random_returns_the_requested_length_and_varies() {
-    boot();
+    let _serial = boot();
 
     let first = run(CC_GET_RANDOM, &16u16.to_be_bytes());
     assert_eq!(first.code, RC_SUCCESS);
@@ -100,7 +106,7 @@ fn get_random_returns_the_requested_length_and_varies() {
 
 #[test]
 fn get_capability_lists_commands() {
-    boot();
+    let _serial = boot();
 
     let mut params = Vec::new();
     params.extend_from_slice(&0x0000_0002u32.to_be_bytes()); // TPM_CAP_COMMANDS
@@ -114,7 +120,7 @@ fn get_capability_lists_commands() {
 
 #[test]
 fn pcr_read_succeeds() {
-    boot();
+    let _serial = boot();
 
     // TPML_PCR_SELECTION: one SHA-256 selection over PCRs 0-7.
     let mut params = Vec::new();
@@ -180,7 +186,7 @@ fn create_primary() -> Response {
 /// wolfCrypt SP math, end to end.
 #[test]
 fn ecc_create_primary_generates_a_key() {
-    boot();
+    let _serial = boot();
 
     let rsp = create_primary();
     assert_eq!(
@@ -203,7 +209,7 @@ fn ecc_create_primary_generates_a_key() {
 /// endorsement key stable for as long as the firmware stays powered.
 #[test]
 fn create_primary_is_deterministic_within_a_boot() {
-    boot();
+    let _serial = boot();
 
     let first = create_primary();
     let second = create_primary();
@@ -220,14 +226,14 @@ fn create_primary_is_deterministic_within_a_boot() {
 
 #[test]
 fn oversized_commands_are_rejected_not_truncated() {
-    boot();
+    let _serial = boot();
     let huge = vec![0u8; tpm::ffi::max_command_size() + 1];
     assert_eq!(tpm::process(&huge), Err(tpm::Error::Oversized));
 }
 
 #[test]
 fn malformed_commands_get_a_tpm_error_rather_than_a_panic() {
-    boot();
+    let _serial = boot();
     // A well-formed header naming a command code that does not exist.
     let rsp = run(0x0000_FFFF, &[]);
     assert_ne!(rsp.code, RC_SUCCESS);

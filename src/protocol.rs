@@ -44,7 +44,23 @@ pub enum MsgType {
     Disconnect = 7,
     EchoRequest = 8,
     EchoResponse = 9,
+    TpmCommand = 10,
+    TpmResponse = 11,
 }
+
+/// Largest TPM packet that can be reassembled from a fragment sequence.
+/// Matches the TPM core's own command buffer, so a peer cannot make the
+/// device buffer more than the TPM would ever accept.
+pub fn max_tpm_packet_len() -> usize {
+    crate::tpm::max_command_size()
+}
+
+/// Payload bytes carried by one TPM fragment: a Noise message minus its tag,
+/// minus the two-byte fragment header.
+pub const TPM_CHUNK_LEN: usize = crate::framing::MAX_PAYLOAD_LEN - 16 - 2;
+
+/// Set in a fragment's flag byte while more fragments follow.
+const FLAG_MORE: u8 = 0x01;
 
 impl MsgType {
     fn from_u8(b: u8) -> Option<Self> {
@@ -58,6 +74,8 @@ impl MsgType {
             7 => Self::Disconnect,
             8 => Self::EchoRequest,
             9 => Self::EchoResponse,
+            10 => Self::TpmCommand,
+            11 => Self::TpmResponse,
             _ => return None,
         })
     }
@@ -77,6 +95,11 @@ pub enum Message {
     Disconnect,
     EchoRequest { value: u64 },
     EchoResponse { value: u64 },
+    /// One fragment of a TPM 2.0 command packet. `more` is set on every
+    /// fragment but the last.
+    TpmCommand { more: bool, chunk: Vec<u8> },
+    /// One fragment of a TPM 2.0 response packet.
+    TpmResponse { more: bool, chunk: Vec<u8> },
 }
 
 impl Message {
@@ -112,6 +135,16 @@ impl Message {
                 out.push(MsgType::EchoResponse as u8);
                 out.extend_from_slice(&value.to_be_bytes());
             }
+            Message::TpmCommand { more, chunk } => {
+                out.push(MsgType::TpmCommand as u8);
+                out.push(if *more { FLAG_MORE } else { 0 });
+                out.extend_from_slice(chunk);
+            }
+            Message::TpmResponse { more, chunk } => {
+                out.push(MsgType::TpmResponse as u8);
+                out.push(if *more { FLAG_MORE } else { 0 });
+                out.extend_from_slice(chunk);
+            }
         }
         out
     }
@@ -141,6 +174,20 @@ impl Message {
             MsgType::EchoResponse => Message::EchoResponse {
                 value: read_be64(payload)?,
             },
+            MsgType::TpmCommand => {
+                let (&flags, chunk) = payload.split_first().ok_or(Error::Protocol)?;
+                Message::TpmCommand {
+                    more: flags & FLAG_MORE != 0,
+                    chunk: chunk.into(),
+                }
+            }
+            MsgType::TpmResponse => {
+                let (&flags, chunk) = payload.split_first().ok_or(Error::Protocol)?;
+                Message::TpmResponse {
+                    more: flags & FLAG_MORE != 0,
+                    chunk: chunk.into(),
+                }
+            }
         })
     }
 }
@@ -200,12 +247,107 @@ impl<T: Read + Write> NoiseLink<T> {
         }
     }
 
+    /// Sends a TPM packet as a fragment sequence. A zero-length packet still
+    /// yields one fragment, so the peer always sees a reply.
+    async fn send_tpm_fragments(&mut self, packet: &[u8], command: bool) -> Result<(), Error> {
+        let mut chunks = packet.chunks(TPM_CHUNK_LEN);
+        let mut current = chunks.next().unwrap_or(&[]);
+        loop {
+            let next = chunks.next();
+            let more = next.is_some();
+            let chunk: Vec<u8> = current.into();
+            let msg = if command {
+                Message::TpmCommand { more, chunk }
+            } else {
+                Message::TpmResponse { more, chunk }
+            };
+            self.send_msg(&msg).await?;
+            match next {
+                Some(chunk) => current = chunk,
+                None => return Ok(()),
+            }
+        }
+    }
+
+    /// Host side of the TPM transport: sends a raw TPM 2.0 command packet.
+    pub async fn send_tpm_command(&mut self, packet: &[u8]) -> Result<(), Error> {
+        self.send_tpm_fragments(packet, true).await
+    }
+
+    /// Device side of the TPM transport: sends a raw TPM 2.0 response packet.
+    pub async fn send_tpm_response(&mut self, packet: &[u8]) -> Result<(), Error> {
+        self.send_tpm_fragments(packet, false).await
+    }
+
+    /// Reassembles one TPM packet, stepping over interleaved log output.
+    /// Errors on any other message type, which would mean the peer abandoned
+    /// the sequence.
+    pub async fn receive_tpm_packet(&mut self) -> Result<Vec<u8>, Error> {
+        let mut packet: Vec<u8> = Vec::new();
+        loop {
+            let (more, chunk) = match self.receive_msg().await? {
+                Message::Log(_) => continue,
+                Message::TpmResponse { more, chunk } => (more, chunk),
+                Message::TpmCommand { more, chunk } => (more, chunk),
+                _ => return Err(Error::Protocol),
+            };
+            packet.extend_from_slice(&chunk);
+            if !more {
+                return Ok(packet);
+            }
+        }
+    }
+
+    async fn handle_tpm_fragment(
+        &mut self,
+        pending: &mut Vec<u8>,
+        more: bool,
+        chunk: Vec<u8>,
+    ) -> Result<(), Error> {
+        if !self.is_peer_trusted() {
+            crate::error!("TPM access refused: peer is not paired");
+            pending.clear();
+            return self.send_tpm_response(&[]).await;
+        }
+
+        if pending.len() + chunk.len() > max_tpm_packet_len() {
+            crate::error!("TPM command exceeds the maximum packet length");
+            pending.clear();
+            return self.send_tpm_response(&[]).await;
+        }
+        pending.extend_from_slice(&chunk);
+
+        if more {
+            return Ok(());
+        }
+
+        let packet = core::mem::take(pending);
+        match crate::tpm::dispatch(&packet).await {
+            Ok(response) => self.send_tpm_response(&response).await,
+            Err(e) => {
+                crate::error!("TPM rejected a command: {:?}", e);
+                self.send_tpm_response(&[]).await
+            }
+        }
+    }
+
     async fn handle_message<K: KeyStore>(
         &mut self,
         keystore: &mut K,
+        pending: &mut Vec<u8>,
         msg: Message,
     ) -> Result<Option<SessionEnd>, Error> {
+        // Anything that is not the next fragment abandons a partial packet,
+        // so an interrupted sequence cannot be resumed or spliced into.
+        if !matches!(msg, Message::TpmCommand { .. }) {
+            pending.clear();
+        }
+
         match msg {
+            Message::TpmCommand { more, chunk } => {
+                self.handle_tpm_fragment(pending, more, chunk).await?;
+                Ok(None)
+            }
             Message::EchoRequest { value } => {
                 let value = value.checked_add(1).expect("EchoRequest overflow");
                 self.send_msg(&Message::EchoResponse { value }).await?;
@@ -248,6 +390,7 @@ impl<T: Read + Write> NoiseLink<T> {
     }
 
     pub async fn run_session<K: KeyStore>(&mut self, keystore: &mut K) -> SessionEnd {
+        let mut pending: Vec<u8> = Vec::new();
         loop {
             // Real protocol messages always win: race an inbound message
             // against "log output is available". Backlogged logs are sent one
@@ -257,7 +400,7 @@ impl<T: Read + Write> NoiseLink<T> {
             match select(self.receive_msg(), crate::log::wait_readable()).await {
                 Either::First(result) => {
                     let result = match result {
-                        Ok(msg) => self.handle_message(keystore, msg).await,
+                        Ok(msg) => self.handle_message(keystore, &mut pending, msg).await,
                         Err(e) => Err(e),
                     };
                     match result {
