@@ -1,5 +1,6 @@
 pub mod c_heap;
 pub mod ffi;
+pub mod masked_nv;
 pub mod masked_slots;
 
 pub use ffi::{Error, init, max_command_size, process, reinit, reset_client, shutdown, version};

@@ -37,6 +37,7 @@ pub fn version() -> &'static str {
 /// Brings up the TPM. Hierarchy seeds are drawn from the RNG here and live
 /// only in RAM, so this establishes a fresh TPM identity every time it runs.
 pub fn init() -> Result<(), Error> {
+    super::masked_nv::init();
     super::masked_slots::init();
     match unsafe { ashen_tpm_init() } {
         0 => Ok(()),

@@ -30,7 +30,7 @@ use static_cell::StaticCell;
 use ashen_fw::panic_link as _;
 
 #[global_allocator]
-static ALLOCATOR: emballoc::Allocator<65536> = emballoc::Allocator::new();
+static ALLOCATOR: emballoc::Allocator<131072> = emballoc::Allocator::new();
 
 bind_interrupts!(struct Irqs {
     LPUART1 => embassy_stm32::usart::InterruptHandler<LPUART1>;

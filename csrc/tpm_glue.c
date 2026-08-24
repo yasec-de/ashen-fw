@@ -7,37 +7,40 @@
 
 extern unsigned long long ashen_now_ms(void);
 
+/* Masked NV backing store, implemented on the Rust side over MaskedCell so
+ * the journal - which holds the hierarchy seeds - is wear-levelled. */
+extern int ashen_nv_size(void);
+extern int ashen_nv_read(word32 offset, byte* buf, word32 len);
+extern int ashen_nv_write(word32 offset, const byte* buf, word32 len);
+extern int ashen_nv_fill(word32 offset, word32 len, byte value);
+
 static FWTPM_CTX  g_ctx;
 static int        g_ready;
-static byte       g_nv[FWTPM_NV_MAX_SIZE];
 
 static int nv_read(void* halCtx, word32 offset, byte* buf, word32 size)
 {
     (void)halCtx;
-    if (buf == NULL || (word64)offset + size > sizeof(g_nv)) {
+    if (buf == NULL || ashen_nv_read(offset, buf, size) != 0) {
         return BAD_FUNC_ARG;
     }
-    XMEMCPY(buf, g_nv + offset, size);
     return 0;
 }
 
 static int nv_write(void* halCtx, word32 offset, const byte* buf, word32 size)
 {
     (void)halCtx;
-    if (buf == NULL || (word64)offset + size > sizeof(g_nv)) {
+    if (buf == NULL || ashen_nv_write(offset, buf, size) != 0) {
         return BAD_FUNC_ARG;
     }
-    XMEMCPY(g_nv + offset, buf, size);
     return 0;
 }
 
 static int nv_erase(void* halCtx, word32 offset, word32 size)
 {
     (void)halCtx;
-    if ((word64)offset + size > sizeof(g_nv)) {
+    if (ashen_nv_fill(offset, size, 0xFF) != 0) {
         return BAD_FUNC_ARG;
     }
-    XMEMSET(g_nv + offset, 0xFF, size);
     return 0;
 }
 
@@ -72,14 +75,16 @@ int ashen_tpm_init(void)
     }
 
     XMEMSET(&g_ctx, 0, sizeof(g_ctx));
-    XMEMSET(g_nv, 0xFF, sizeof(g_nv));
+    if (ashen_nv_fill(0, (word32)ashen_nv_size(), 0xFF) != 0) {
+        return BAD_FUNC_ARG;
+    }
 
     XMEMSET(&hal, 0, sizeof(hal));
     hal.read       = nv_read;
     hal.write      = nv_write;
     hal.erase      = nv_erase;
     hal.ctx        = NULL;
-    hal.maxSize    = (word32)sizeof(g_nv);
+    hal.maxSize    = (word32)ashen_nv_size();
     hal.writeAlign = 0;
     hal.appendOnly = 0;
 
@@ -123,7 +128,7 @@ int ashen_tpm_shutdown(void)
         rc = FWTPM_Cleanup(&g_ctx);
         g_ready = 0;
     }
-    wc_ForceZero(g_nv, sizeof(g_nv));
+    ashen_nv_fill(0, (word32)ashen_nv_size(), 0x00);
     wc_ForceZero(&g_ctx, sizeof(g_ctx));
     return rc;
 }
