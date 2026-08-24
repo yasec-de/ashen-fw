@@ -45,16 +45,25 @@ impl embedded_io::ErrorType for ChannelIo {
 }
 
 impl embedded_io_async::Read for ChannelIo {
+    /// Yields instead of blocking when no byte is ready. A blocking `recv()`
+    /// here would wedge the whole executor inside one arm of a `select`, which
+    /// the firmware's DMA-backed reader never does, and would hide any bug in
+    /// code that depends on the other arms making progress.
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
         if buf.is_empty() {
             return Ok(0);
         }
-        match self.rx.recv() {
-            Ok(byte) => {
-                buf[0] = byte;
-                Ok(1)
+        loop {
+            match self.rx.try_recv() {
+                Ok(byte) => {
+                    buf[0] = byte;
+                    return Ok(1);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    embassy_futures::yield_now().await;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => return Err(ChannelError),
             }
-            Err(_) => Err(ChannelError),
         }
     }
 }

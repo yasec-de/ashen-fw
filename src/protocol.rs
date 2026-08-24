@@ -20,7 +20,7 @@
 
 use alloc::vec::Vec;
 
-use embassy_futures::select::{Either, select};
+use embassy_futures::select::{Either3, select3};
 use embedded_io_async::{Read, Write};
 
 use crate::noise_link::{Error, KeyStore, NoiseLink};
@@ -198,6 +198,15 @@ fn read_be64(payload: &[u8]) -> Result<u64, Error> {
     Ok(u64::from_be_bytes(bytes))
 }
 
+/// Per-session TPM transport state: the fragments of a command still being
+/// reassembled, and whether one has been handed to the TPM and not yet
+/// answered.
+#[derive(Default)]
+struct TpmState {
+    pending: Vec<u8>,
+    in_flight: bool,
+}
+
 #[derive(Debug)]
 pub enum SessionEnd {
     Disconnected,
@@ -300,52 +309,57 @@ impl<T: Read + Write> NoiseLink<T> {
 
     async fn handle_tpm_fragment(
         &mut self,
-        pending: &mut Vec<u8>,
+        tpm: &mut TpmState,
         more: bool,
         chunk: Vec<u8>,
     ) -> Result<(), Error> {
         if !self.is_peer_trusted() {
             crate::error!("TPM access refused: peer is not paired");
-            pending.clear();
+            tpm.pending.clear();
             return self.send_tpm_response(&[]).await;
         }
 
-        if pending.len() + chunk.len() > max_tpm_packet_len() {
-            crate::error!("TPM command exceeds the maximum packet length");
-            pending.clear();
+        if tpm.in_flight {
+            crate::error!("TPM command refused: one is already running");
+            tpm.pending.clear();
             return self.send_tpm_response(&[]).await;
         }
-        pending.extend_from_slice(&chunk);
+
+        if tpm.pending.len() + chunk.len() > max_tpm_packet_len() {
+            crate::error!("TPM command exceeds the maximum packet length");
+            tpm.pending.clear();
+            return self.send_tpm_response(&[]).await;
+        }
+        tpm.pending.extend_from_slice(&chunk);
 
         if more {
             return Ok(());
         }
 
-        let packet = core::mem::take(pending);
-        match crate::tpm::dispatch(&packet).await {
-            Ok(response) => self.send_tpm_response(&response).await,
-            Err(e) => {
-                crate::error!("TPM rejected a command: {:?}", e);
-                self.send_tpm_response(&[]).await
-            }
-        }
+        // Hand it off and go back to servicing the link. The answer arrives as
+        // the third arm of `run_session`'s select.
+        let packet = core::mem::take(&mut tpm.pending);
+        crate::tpm::submit(&packet).await;
+        tpm.in_flight = true;
+        Ok(())
     }
 
     async fn handle_message<K: KeyStore>(
         &mut self,
         keystore: &mut K,
-        pending: &mut Vec<u8>,
+        tpm: &mut TpmState,
         msg: Message,
     ) -> Result<Option<SessionEnd>, Error> {
         // Anything that is not the next fragment abandons a partial packet,
-        // so an interrupted sequence cannot be resumed or spliced into.
+        // so an interrupted sequence cannot be resumed or spliced into. An
+        // already-dispatched command is unaffected: its answer is still owed.
         if !matches!(msg, Message::TpmCommand { .. }) {
-            pending.clear();
+            tpm.pending.clear();
         }
 
         match msg {
             Message::TpmCommand { more, chunk } => {
-                self.handle_tpm_fragment(pending, more, chunk).await?;
+                self.handle_tpm_fragment(tpm, more, chunk).await?;
                 Ok(None)
             }
             Message::EchoRequest { value } => {
@@ -390,43 +404,88 @@ impl<T: Read + Write> NoiseLink<T> {
     }
 
     pub async fn run_session<K: KeyStore>(&mut self, keystore: &mut K) -> SessionEnd {
-        let mut pending: Vec<u8> = Vec::new();
-        loop {
+        let mut tpm = TpmState::default();
+
+        let end = loop {
             // Real protocol messages always win: race an inbound message
             // against "log output is available". Backlogged logs are sent one
             // chunk at a time in the gaps when nothing is being received, so a
             // message queued mid-log-burst is serviced right after the current
             // chunk rather than behind the whole backlog.
-            match select(self.receive_msg(), crate::log::wait_readable()).await {
-                Either::First(result) => {
+            //
+            // The third arm is the TPM's answer to a command already handed
+            // off. It only exists while one is in flight; otherwise it is a
+            // future that never completes, so the other two race as before.
+            // This is what keeps the heartbeat and the log pipe serviced
+            // during a key generation that takes hundreds of milliseconds.
+            let tpm_answer = async {
+                if tpm.in_flight {
+                    crate::tpm::take_response().await
+                } else {
+                    core::future::pending().await
+                }
+            };
+
+            match select3(
+                self.receive_msg(),
+                crate::log::wait_readable(),
+                tpm_answer,
+            )
+            .await
+            {
+                Either3::First(result) => {
                     let result = match result {
-                        Ok(msg) => self.handle_message(keystore, &mut pending, msg).await,
+                        Ok(msg) => self.handle_message(keystore, &mut tpm, msg).await,
                         Err(e) => Err(e),
                     };
                     match result {
-                        Ok(Some(end)) => return end,
+                        Ok(Some(end)) => break end,
                         Ok(None) => {}
-                        Err(e) => return SessionEnd::Error(e),
+                        Err(e) => break SessionEnd::Error(e),
                     }
                     // Flush whatever the handler just logged before looping.
                     // `select` polls the receive arm first, so a host that
                     // pipelines its requests would otherwise win the race on
                     // every iteration and starve the pipe indefinitely.
                     if let Err(e) = self.flush_one_log().await {
-                        return SessionEnd::Error(e);
+                        break SessionEnd::Error(e);
                     }
                 }
 
                 // No message pending and log output is buffered: send exactly
                 // one chunk, then loop back so a freshly-arrived message
                 // preempts the rest of the backlog.
-                Either::Second(()) => {
+                Either3::Second(()) => {
                     if let Err(e) = self.flush_one_log().await {
-                        return SessionEnd::Error(e);
+                        break SessionEnd::Error(e);
+                    }
+                }
+
+                Either3::Third(answer) => {
+                    tpm.in_flight = false;
+                    let packet = match answer {
+                        Ok(response) => response,
+                        Err(e) => {
+                            crate::error!("TPM rejected a command: {:?}", e);
+                            Vec::new()
+                        }
+                    };
+                    if let Err(e) = self.send_tpm_response(&packet).await {
+                        break SessionEnd::Error(e);
                     }
                 }
             }
+        };
+
+        // The TPM owes exactly one answer per command and cannot be cancelled
+        // mid-call, so wait for it rather than leaving it to be delivered into
+        // the next peer's session.
+        if tpm.in_flight {
+            let _ = crate::tpm::take_response().await;
         }
+        crate::tpm::discard_response();
+
+        end
     }
 }
 

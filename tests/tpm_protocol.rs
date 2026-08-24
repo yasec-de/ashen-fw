@@ -225,6 +225,49 @@ fn an_interrupted_fragment_sequence_is_discarded() {
     });
 }
 
+/// The heartbeat is a periodic `EchoRequest`, so it must not queue behind a
+/// TPM command. `run_session` races the link against the TPM's answer rather
+/// than awaiting the answer inline; this is the test that says so.
+#[test]
+fn a_heartbeat_is_answered_while_a_tpm_command_is_outstanding() {
+    with_session(0x1111_0008, true, |client| {
+        startup(client);
+        embassy_futures::block_on(async {
+            client
+                .send_tpm_command(&command(CC_GET_RANDOM, &16u16.to_be_bytes()))
+                .await
+                .expect("send command");
+            client
+                .send_msg(&Message::EchoRequest { value: 41 })
+                .await
+                .expect("send heartbeat");
+
+            let mut echoed = false;
+            let mut answer: Option<Vec<u8>> = None;
+            let mut packet = Vec::new();
+
+            while !echoed || answer.is_none() {
+                match client.receive_msg().await.expect("receive") {
+                    Message::Log(_) => {}
+                    Message::EchoResponse { value } => {
+                        assert_eq!(value, 42);
+                        echoed = true;
+                    }
+                    Message::TpmResponse { more, chunk } => {
+                        packet.extend_from_slice(&chunk);
+                        if !more {
+                            answer = Some(std::mem::take(&mut packet));
+                        }
+                    }
+                    other => panic!("unexpected message: {other:?}"),
+                }
+            }
+
+            assert_eq!(response_code(&answer.unwrap()), RC_SUCCESS);
+        });
+    });
+}
+
 #[test]
 fn an_unpaired_peer_cannot_drive_the_tpm() {
     with_session(0x1111_0007, false, |client| {

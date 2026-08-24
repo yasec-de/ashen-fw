@@ -5,25 +5,37 @@ pub mod masked_slots;
 
 pub use ffi::{Error, init, max_command_size, process, reinit, reset_client, shutdown, version};
 
-/// Runs one TPM command on behalf of a session.
+/// Hands one TPM command off to be executed, without waiting for the answer.
 ///
-/// On the firmware this hands the command to [`task`], which runs on the
-/// low-priority thread-mode executor, and awaits the reply — so a
-/// hundred-millisecond key generation cannot stall the link, the log pipe or
-/// the heartbeat, which all live on a higher-priority executor. On the host
-/// there is only one executor, so it calls straight through.
+/// On the firmware this queues it for [`task`], which runs on the low-priority
+/// thread-mode executor. The caller then goes back to servicing the link and
+/// picks the answer up from [`take_response`] as one arm of its `select`, so a
+/// hundred-millisecond key generation blocks neither the heartbeat nor the log
+/// pipe. On the host there is no second executor, so the command runs inline
+/// and the answer is queued for the same [`take_response`] to collect.
 #[cfg(target_os = "none")]
-pub async fn dispatch(cmd: &[u8]) -> Result<alloc::vec::Vec<u8>, Error> {
+pub async fn submit(cmd: &[u8]) {
     channel::COMMANDS.send(cmd.into()).await;
-    channel::RESPONSES.receive().await
 }
 
 #[cfg(not(target_os = "none"))]
-pub async fn dispatch(cmd: &[u8]) -> Result<alloc::vec::Vec<u8>, Error> {
-    process(cmd)
+pub async fn submit(cmd: &[u8]) {
+    channel::RESPONSES.send(process(cmd)).await;
 }
 
-#[cfg(target_os = "none")]
+/// Collects the answer to the command most recently handed to [`submit`].
+///
+/// Cancel-safe: dropping the future leaves the answer queued.
+pub async fn take_response() -> Result<alloc::vec::Vec<u8>, Error> {
+    channel::RESPONSES.receive().await
+}
+
+/// Discards an answer nobody is going to collect. Used at session teardown so
+/// a reply cannot be delivered into the next session.
+pub fn discard_response() {
+    let _ = channel::RESPONSES.try_receive();
+}
+
 mod channel {
     use alloc::vec::Vec;
 
@@ -32,6 +44,7 @@ mod channel {
 
     use super::Error;
 
+    #[cfg(target_os = "none")]
     pub(super) static COMMANDS: Channel<CriticalSectionRawMutex, Vec<u8>, 1> = Channel::new();
     pub(super) static RESPONSES: Channel<CriticalSectionRawMutex, Result<Vec<u8>, Error>, 1> =
         Channel::new();
