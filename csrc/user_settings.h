@@ -73,6 +73,7 @@
 #define HAVE_AES_KEYWRAP
 #define GCM_SMALL
 
+#define HAVE_HKDF
 #define WOLFSSL_SHA384
 #define WOLFSSL_SHA512
 #define HAVE_SHA512

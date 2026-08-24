@@ -9,6 +9,7 @@ const WOLFCRYPT_SOURCES: &[&str] = &[
     "error.c",
     "hash.c",
     "hmac.c",
+    "kdf.c",
     "logging.c",
     "memory.c",
     "misc.c",
