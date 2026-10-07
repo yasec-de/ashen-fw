@@ -10,11 +10,24 @@ use ashen_fw::test_util::TestKeyStore;
 use ashen_fw::tpm;
 
 mod common;
-use common::{ChannelIo, duplex_pair, rng, secret_keys};
+use common::{ChannelIo, WriteGate, duplex_pair, duplex_pair_gated, rng, secret_keys};
 
 const ST_NO_SESSIONS: u16 = 0x8001;
 const CC_STARTUP: u32 = 0x0000_0144;
 const CC_GET_RANDOM: u32 = 0x0000_017B;
+const CC_NV_DEFINE_SPACE: u32 = 0x0000_012A;
+const CC_NV_WRITE: u32 = 0x0000_0137;
+const CC_NV_READ: u32 = 0x0000_014E;
+const ST_SESSIONS: u16 = 0x8002;
+const TPM_RH_OWNER: u32 = 0x4000_0001;
+const TPM_RS_PW: u32 = 0x4000_0009;
+const TPM_ALG_SHA256: u16 = 0x000B;
+const TPMA_NV_AUTHWRITE: u32 = 1 << 2;
+const TPMA_NV_AUTHREAD: u32 = 1 << 18;
+const TPMA_NV_NO_DA: u32 = 1 << 25;
+const RC_NV_DEFINED: u32 = 0x0000_014C;
+const NV_INDEX: u32 = 0x0150_0A5E;
+const NV_SIZE: u16 = 512;
 const CC_UNKNOWN: u32 = 0x0000_FFFF;
 const SU_CLEAR: u16 = 0x0000;
 const RC_SUCCESS: u32 = 0x0000_0000;
@@ -38,6 +51,55 @@ fn command(cc: u32, params: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&cc.to_be_bytes());
     out.extend_from_slice(params);
     out
+}
+
+fn pw_command(cc: u32, handles: &[u32], params: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for handle in handles {
+        body.extend_from_slice(&handle.to_be_bytes());
+    }
+    body.extend_from_slice(&9u32.to_be_bytes());
+    body.extend_from_slice(&TPM_RS_PW.to_be_bytes());
+    body.extend_from_slice(&0u16.to_be_bytes());
+    body.push(0);
+    body.extend_from_slice(&0u16.to_be_bytes());
+    body.extend_from_slice(params);
+
+    let mut out = Vec::with_capacity(10 + body.len());
+    out.extend_from_slice(&ST_SESSIONS.to_be_bytes());
+    out.extend_from_slice(&((10 + body.len()) as u32).to_be_bytes());
+    out.extend_from_slice(&cc.to_be_bytes());
+    out.extend_from_slice(&body);
+    out
+}
+
+fn nv_fill(client: &mut NoiseLink<ChannelIo>) {
+    let mut public = Vec::new();
+    public.extend_from_slice(&NV_INDEX.to_be_bytes());
+    public.extend_from_slice(&TPM_ALG_SHA256.to_be_bytes());
+    public.extend_from_slice(
+        &(TPMA_NV_AUTHWRITE | TPMA_NV_AUTHREAD | TPMA_NV_NO_DA).to_be_bytes(),
+    );
+    public.extend_from_slice(&0u16.to_be_bytes());
+    public.extend_from_slice(&NV_SIZE.to_be_bytes());
+    let mut params = Vec::new();
+    params.extend_from_slice(&0u16.to_be_bytes());
+    params.extend_from_slice(&(public.len() as u16).to_be_bytes());
+    params.extend_from_slice(&public);
+    let rsp = exchange(client, &pw_command(CC_NV_DEFINE_SPACE, &[TPM_RH_OWNER], &params));
+    let code = response_code(&rsp);
+    assert!(
+        code == RC_SUCCESS || code == RC_NV_DEFINED,
+        "TPM2_NV_DefineSpace failed with 0x{code:08X}"
+    );
+
+    let mut params = Vec::new();
+    params.extend_from_slice(&NV_SIZE.to_be_bytes());
+    params.extend((0..NV_SIZE).map(|i| i as u8));
+    params.extend_from_slice(&0u16.to_be_bytes());
+    let rsp = exchange(client, &pw_command(CC_NV_WRITE, &[NV_INDEX, NV_INDEX], &params));
+    let code = response_code(&rsp);
+    assert_eq!(code, RC_SUCCESS, "TPM2_NV_Write failed with 0x{code:08X}");
 }
 
 /// A command padded out to exactly `len` bytes. The TPM will reject the trailing
@@ -68,12 +130,19 @@ fn with_session<F>(seed: u64, paired: bool, client_body: F)
 where
     F: FnOnce(&mut NoiseLink<ChannelIo>),
 {
+    with_gated_session(seed, paired, |client, _| client_body(client));
+}
+
+fn with_gated_session<F>(seed: u64, paired: bool, client_body: F)
+where
+    F: FnOnce(&mut NoiseLink<ChannelIo>, &WriteGate),
+{
     let _serial = boot();
     let server_keys = generate_keypair(rng(seed)).unwrap();
     let client_keys = generate_keypair(rng(seed ^ 0x5555_5555_5555)).unwrap();
     let client_public: [u8; 32] = client_keys.public.clone().try_into().unwrap();
 
-    let (client_io, server_io) = duplex_pair();
+    let (client_io, server_io, gate) = duplex_pair_gated();
     let client_secrets = secret_keys(&client_keys.private);
     let server_static = server_keys.private.clone();
 
@@ -106,7 +175,7 @@ where
     ))
     .expect("client handshake failed");
 
-    client_body(&mut client);
+    client_body(&mut client, &gate);
     embassy_futures::block_on(client.send_disconnect()).expect("send disconnect");
 
     server_thread.join().expect("server thread panicked");
@@ -189,22 +258,30 @@ fn a_command_one_byte_over_the_cap_is_refused_and_the_link_survives() {
 }
 
 #[test]
-fn an_interrupted_fragment_sequence_is_discarded() {
+fn a_control_message_inside_a_fragment_sequence_does_not_break_it() {
     with_session(0x1111_0006, true, |client| {
         startup(client);
-        embassy_futures::block_on(async {
-            // Half of a command, then a different message type.
+        let cmd = command(CC_GET_RANDOM, &8u16.to_be_bytes());
+        let (head, tail) = cmd.split_at(6);
+        let rsp = embassy_futures::block_on(async {
             client
                 .send_msg(&Message::TpmCommand {
                     more: true,
-                    chunk: vec![0xDE; 64],
+                    chunk: head.into(),
                 })
                 .await
-                .expect("send partial fragment");
+                .expect("send first fragment");
             client
                 .send_msg(&Message::StatusRequest)
                 .await
                 .expect("send status request");
+            client
+                .send_msg(&Message::TpmCommand {
+                    more: false,
+                    chunk: tail.into(),
+                })
+                .await
+                .expect("send last fragment");
 
             loop {
                 match client.receive_msg().await.expect("receive") {
@@ -216,12 +293,65 @@ fn an_interrupted_fragment_sequence_is_discarded() {
                     other => panic!("expected a status response, got {other:?}"),
                 }
             }
+            client.receive_tpm_packet().await.expect("receive response")
         });
 
-        // The abandoned prefix must not be spliced onto the next command.
-        let rsp = exchange(client, &command(CC_GET_RANDOM, &8u16.to_be_bytes()));
         assert_eq!(response_code(&rsp), RC_SUCCESS);
         assert_eq!(rsp.len(), 10 + 2 + 8);
+    });
+}
+
+#[test]
+fn a_heartbeat_preempts_a_multi_fragment_response() {
+    with_gated_session(0x1111_0009, true, |client, gate| {
+        startup(client);
+        nv_fill(client);
+        let mut params = Vec::new();
+        params.extend_from_slice(&NV_SIZE.to_be_bytes());
+        params.extend_from_slice(&0u16.to_be_bytes());
+        let cmd = pw_command(CC_NV_READ, &[NV_INDEX, NV_INDEX], &params);
+
+        embassy_futures::block_on(async {
+            gate.close();
+            client.send_tpm_command(&cmd).await.expect("send command");
+            gate.wait_for_blocked_writer();
+            client
+                .send_msg(&Message::EchoRequest { value: 41 })
+                .await
+                .expect("send heartbeat");
+            gate.open();
+
+            let mut fragments = 0;
+            let mut echoed_after = None;
+            let mut packet = Vec::new();
+            loop {
+                match client.receive_msg().await.expect("receive") {
+                    Message::Log(_) => {}
+                    Message::EchoResponse { value } => {
+                        assert_eq!(value, 42);
+                        echoed_after = Some(fragments);
+                    }
+                    Message::TpmResponse { more, chunk } => {
+                        fragments += 1;
+                        packet.extend_from_slice(&chunk);
+                        if !more {
+                            break;
+                        }
+                    }
+                    other => panic!("unexpected message: {other:?}"),
+                }
+            }
+
+            assert!(fragments >= 2, "response fit in {fragments} fragment(s)");
+            assert_eq!(response_code(&packet), RC_SUCCESS);
+            match echoed_after {
+                Some(n) if n > 0 && n < fragments => {}
+                other => panic!(
+                    "echo answered after fragment {other:?} of {fragments}, \
+                     expected strictly inside the response"
+                ),
+            }
+        });
     });
 }
 

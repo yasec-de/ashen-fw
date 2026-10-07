@@ -20,7 +20,7 @@
 
 use alloc::vec::Vec;
 
-use embassy_futures::select::{Either3, select3};
+use embassy_futures::select::{Either4, select4};
 use embedded_io_async::{Read, Write};
 
 use crate::noise_link::{Error, KeyStore, NoiseLink};
@@ -205,6 +205,12 @@ fn read_be64(payload: &[u8]) -> Result<u64, Error> {
 struct TpmState {
     pending: Vec<u8>,
     in_flight: bool,
+    outgoing: Option<(Vec<u8>, usize)>,
+}
+
+fn next_fragment(packet: &[u8], pos: usize) -> (&[u8], bool) {
+    let end = packet.len().min(pos + TPM_CHUNK_LEN);
+    (&packet[pos..end], end < packet.len())
 }
 
 #[derive(Debug)]
@@ -259,23 +265,37 @@ impl<T: Read + Write> NoiseLink<T> {
     /// Sends a TPM packet as a fragment sequence. A zero-length packet still
     /// yields one fragment, so the peer always sees a reply.
     async fn send_tpm_fragments(&mut self, packet: &[u8], command: bool) -> Result<(), Error> {
-        let mut chunks = packet.chunks(TPM_CHUNK_LEN);
-        let mut current = chunks.next().unwrap_or(&[]);
+        let mut pos = 0;
         loop {
-            let next = chunks.next();
-            let more = next.is_some();
-            let chunk: Vec<u8> = current.into();
+            let (chunk, more) = next_fragment(packet, pos);
+            pos += chunk.len();
+            let chunk: Vec<u8> = chunk.into();
             let msg = if command {
                 Message::TpmCommand { more, chunk }
             } else {
                 Message::TpmResponse { more, chunk }
             };
             self.send_msg(&msg).await?;
-            match next {
-                Some(chunk) => current = chunk,
-                None => return Ok(()),
+            if !more {
+                return Ok(());
             }
         }
+    }
+
+    async fn send_next_response_fragment(&mut self, tpm: &mut TpmState) -> Result<(), Error> {
+        let Some((packet, pos)) = tpm.outgoing.as_mut() else {
+            return Ok(());
+        };
+        let (chunk, more) = next_fragment(packet, *pos);
+        *pos += chunk.len();
+        let msg = Message::TpmResponse {
+            more,
+            chunk: chunk.into(),
+        };
+        if !more {
+            tpm.outgoing = None;
+        }
+        self.send_msg(&msg).await
     }
 
     /// Host side of the TPM transport: sends a raw TPM 2.0 command packet.
@@ -319,7 +339,7 @@ impl<T: Read + Write> NoiseLink<T> {
             return self.send_tpm_response(&[]).await;
         }
 
-        if tpm.in_flight {
+        if tpm.in_flight || tpm.outgoing.is_some() {
             crate::error!("TPM command refused: one is already running");
             tpm.pending.clear();
             return self.send_tpm_response(&[]).await;
@@ -337,7 +357,7 @@ impl<T: Read + Write> NoiseLink<T> {
         }
 
         // Hand it off and go back to servicing the link. The answer arrives as
-        // the third arm of `run_session`'s select.
+        // the second arm of `run_session`'s select.
         let packet = core::mem::take(&mut tpm.pending);
         crate::tpm::submit(&packet).await;
         tpm.in_flight = true;
@@ -350,13 +370,6 @@ impl<T: Read + Write> NoiseLink<T> {
         tpm: &mut TpmState,
         msg: Message,
     ) -> Result<Option<SessionEnd>, Error> {
-        // Anything that is not the next fragment abandons a partial packet,
-        // so an interrupted sequence cannot be resumed or spliced into. An
-        // already-dispatched command is unaffected: its answer is still owed.
-        if !matches!(msg, Message::TpmCommand { .. }) {
-            tpm.pending.clear();
-        }
-
         match msg {
             Message::TpmCommand { more, chunk } => {
                 self.handle_tpm_fragment(tpm, more, chunk).await?;
@@ -413,9 +426,9 @@ impl<T: Read + Write> NoiseLink<T> {
             // message queued mid-log-burst is serviced right after the current
             // chunk rather than behind the whole backlog.
             //
-            // The third arm is the TPM's answer to a command already handed
+            // The second arm is the TPM's answer to a command already handed
             // off. It only exists while one is in flight; otherwise it is a
-            // future that never completes, so the other two race as before.
+            // future that never completes, so the other arms race as before.
             // This is what keeps the heartbeat and the log pipe serviced
             // during a key generation that takes hundreds of milliseconds.
             let tpm_answer = async {
@@ -425,15 +438,21 @@ impl<T: Read + Write> NoiseLink<T> {
                     core::future::pending().await
                 }
             };
+            let tpm_output = async {
+                if tpm.outgoing.is_none() {
+                    core::future::pending::<()>().await
+                }
+            };
 
-            match select3(
+            match select4(
                 self.receive_msg(),
-                crate::log::wait_readable(),
                 tpm_answer,
+                tpm_output,
+                crate::log::wait_readable(),
             )
             .await
             {
-                Either3::First(result) => {
+                Either4::First(result) => {
                     let result = match result {
                         Ok(msg) => self.handle_message(keystore, &mut tpm, msg).await,
                         Err(e) => Err(e),
@@ -452,16 +471,7 @@ impl<T: Read + Write> NoiseLink<T> {
                     }
                 }
 
-                // No message pending and log output is buffered: send exactly
-                // one chunk, then loop back so a freshly-arrived message
-                // preempts the rest of the backlog.
-                Either3::Second(()) => {
-                    if let Err(e) = self.flush_one_log().await {
-                        break SessionEnd::Error(e);
-                    }
-                }
-
-                Either3::Third(answer) => {
+                Either4::Second(answer) => {
                     tpm.in_flight = false;
                     let packet = match answer {
                         Ok(response) => response,
@@ -470,7 +480,20 @@ impl<T: Read + Write> NoiseLink<T> {
                             Vec::new()
                         }
                     };
-                    if let Err(e) = self.send_tpm_response(&packet).await {
+                    tpm.outgoing = Some((packet, 0));
+                }
+
+                Either4::Third(()) => {
+                    if let Err(e) = self.send_next_response_fragment(&mut tpm).await {
+                        break SessionEnd::Error(e);
+                    }
+                }
+
+                // No message pending and log output is buffered: send exactly
+                // one chunk, then loop back so a freshly-arrived message
+                // preempts the rest of the backlog.
+                Either4::Fourth(()) => {
+                    if let Err(e) = self.flush_one_log().await {
                         break SessionEnd::Error(e);
                     }
                 }

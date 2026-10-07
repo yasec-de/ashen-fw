@@ -1,7 +1,7 @@
 //! Shared host-side test infrastructure.
 
-use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Condvar, Mutex};
 
 use ashen_fw::noise_link::SecretKeys;
 
@@ -19,6 +19,48 @@ pub fn secret_keys(identity: &[u8]) -> SecretKeys {
 pub struct ChannelIo {
     tx: Sender<u8>,
     rx: Receiver<u8>,
+    gate: Option<Arc<WriteGate>>,
+}
+
+#[derive(Default)]
+pub struct WriteGate {
+    state: Mutex<GateState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct GateState {
+    closed: bool,
+    writer_waiting: bool,
+}
+
+#[allow(dead_code)]
+impl WriteGate {
+    pub fn close(&self) {
+        self.state.lock().unwrap().closed = true;
+    }
+
+    pub fn open(&self) {
+        self.state.lock().unwrap().closed = false;
+        self.changed.notify_all();
+    }
+
+    pub fn wait_for_blocked_writer(&self) {
+        let mut state = self.state.lock().unwrap();
+        while !state.writer_waiting {
+            state = self.changed.wait(state).unwrap();
+        }
+    }
+
+    fn pass(&self) {
+        let mut state = self.state.lock().unwrap();
+        while state.closed {
+            state.writer_waiting = true;
+            self.changed.notify_all();
+            state = self.changed.wait(state).unwrap();
+        }
+        state.writer_waiting = false;
+    }
 }
 
 #[derive(Debug)]
@@ -70,6 +112,9 @@ impl embedded_io_async::Read for ChannelIo {
 
 impl embedded_io_async::Write for ChannelIo {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+        if let Some(gate) = &self.gate {
+            gate.pass();
+        }
         for &byte in buf {
             self.tx.send(byte).map_err(|_| ChannelError)?;
         }
@@ -83,16 +128,25 @@ impl embedded_io_async::Write for ChannelIo {
 
 /// Returns a pair of connected [`ChannelIo`] endpoints.
 pub fn duplex_pair() -> (ChannelIo, ChannelIo) {
+    let (a, b, _) = duplex_pair_gated();
+    (a, b)
+}
+
+pub fn duplex_pair_gated() -> (ChannelIo, ChannelIo, Arc<WriteGate>) {
     let (a_to_b_tx, a_to_b_rx) = channel();
     let (b_to_a_tx, b_to_a_rx) = channel();
+    let gate = Arc::new(WriteGate::default());
     (
         ChannelIo {
             tx: a_to_b_tx,
             rx: b_to_a_rx,
+            gate: None,
         },
         ChannelIo {
             tx: b_to_a_tx,
             rx: a_to_b_rx,
+            gate: Some(gate.clone()),
         },
+        gate,
     )
 }
