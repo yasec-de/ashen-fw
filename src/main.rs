@@ -55,8 +55,11 @@ bind_interrupts!(struct Irqs {
     RNG => embassy_stm32::rng::InterruptHandler<RNG>;
 });
 
-/// Size of the LPUART1 DMA RX ring buffer.
-const UART_BUF_LEN: usize = 256;
+/// Size of the LPUART1 DMA RX ring buffer. At 4 Mbaud a full fragment frame
+/// (~516 bytes) arrives in ~1.3 ms and multi-fragment TPM commands send them
+/// back to back; the ring must hold several frames while the link task is busy
+/// decrypting the previous one, or it overruns and the session dies.
+const UART_BUF_LEN: usize = 4096;
 
 static EXECUTOR_HIGH: InterruptExecutor = InterruptExecutor::new();
 
