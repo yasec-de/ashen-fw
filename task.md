@@ -106,8 +106,11 @@ is split across `TpmCommand` / `TpmResponse` fragments.
   header's own size field is the only length information.
 
 The device caps a reassembled command at `FWTPM_MAX_COMMAND_SIZE` = 8192. Going
-over that gets an **empty** `TpmResponse` and the partial packet is discarded.
-An empty response is also what an unpaired peer gets, and what a TPM-level
+over that discards the partial packet and refuses the command. A refused
+command gets exactly one **empty** `TpmResponse`, sent only once its last
+fragment (`more` clear) has arrived; the fragments in between are dropped
+silently. The same single empty response is what an unpaired peer gets, what a
+command sent while another is still running gets, and what a TPM-level
 dispatch failure produces. Treat "empty TPM response" as an error condition and
 report it distinctly from a TPM response carrying a non-zero response code.
 

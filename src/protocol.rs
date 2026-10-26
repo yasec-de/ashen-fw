@@ -204,6 +204,7 @@ fn read_be64(payload: &[u8]) -> Result<u64, Error> {
 #[derive(Default)]
 struct TpmState {
     pending: Vec<u8>,
+    refused: bool,
     in_flight: bool,
     outgoing: Option<(Vec<u8>, usize)>,
 }
@@ -333,21 +334,25 @@ impl<T: Read + Write> NoiseLink<T> {
         more: bool,
         chunk: Vec<u8>,
     ) -> Result<(), Error> {
-        if !self.is_peer_trusted() {
-            crate::error!("TPM access refused: peer is not paired");
-            tpm.pending.clear();
-            return self.send_tpm_response(&[]).await;
+        if !tpm.refused {
+            if !self.is_peer_trusted() {
+                crate::error!("TPM access refused: peer is not paired");
+                tpm.refused = true;
+            } else if tpm.in_flight || tpm.outgoing.is_some() {
+                crate::error!("TPM command refused: one is already running");
+                tpm.refused = true;
+            } else if tpm.pending.len() + chunk.len() > max_tpm_packet_len() {
+                crate::error!("TPM command exceeds the maximum packet length");
+                tpm.refused = true;
+            }
         }
 
-        if tpm.in_flight || tpm.outgoing.is_some() {
-            crate::error!("TPM command refused: one is already running");
+        if tpm.refused {
             tpm.pending.clear();
-            return self.send_tpm_response(&[]).await;
-        }
-
-        if tpm.pending.len() + chunk.len() > max_tpm_packet_len() {
-            crate::error!("TPM command exceeds the maximum packet length");
-            tpm.pending.clear();
+            if more {
+                return Ok(());
+            }
+            tpm.refused = false;
             return self.send_tpm_response(&[]).await;
         }
         tpm.pending.extend_from_slice(&chunk);

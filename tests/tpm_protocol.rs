@@ -243,17 +243,65 @@ fn a_command_filling_the_cap_exactly_is_accepted() {
     });
 }
 
-#[test]
-fn a_command_one_byte_over_the_cap_is_refused_and_the_link_survives() {
-    with_session(0x1111_0005, true, |client| {
-        startup(client);
-        let rsp = exchange(client, &padded_command(max_tpm_packet_len() + 1));
-        assert!(rsp.is_empty(), "oversized command was not refused");
+fn next_msg(client: &mut NoiseLink<ChannelIo>) -> Message {
+    embassy_futures::block_on(async {
+        loop {
+            match client.receive_msg().await.expect("receive") {
+                Message::Log(_) => continue,
+                msg => return msg,
+            }
+        }
+    })
+}
 
-        // The refusal must not have left a partial packet behind.
-        let rsp = exchange(client, &command(CC_GET_RANDOM, &8u16.to_be_bytes()));
-        assert_eq!(response_code(&rsp), RC_SUCCESS);
-        assert_eq!(rsp.len(), 10 + 2 + 8);
+fn send_and_expect_one_refusal(client: &mut NoiseLink<ChannelIo>, packet: &[u8]) {
+    embassy_futures::block_on(client.send_tpm_command(packet)).expect("send command");
+    match next_msg(client) {
+        Message::TpmResponse { more: false, chunk } if chunk.is_empty() => {}
+        other => panic!("expected one empty TpmResponse, got {other:?}"),
+    }
+}
+
+fn assert_get_random_works(client: &mut NoiseLink<ChannelIo>) {
+    let rsp = exchange(client, &command(CC_GET_RANDOM, &8u16.to_be_bytes()));
+    assert_eq!(response_code(&rsp), RC_SUCCESS);
+    assert_eq!(rsp.len(), 10 + 2 + 8);
+}
+
+fn assert_oversized_command_is_refused_once(seed: u64, len: usize) {
+    with_session(seed, true, |client| {
+        startup(client);
+        send_and_expect_one_refusal(client, &padded_command(len));
+        assert_get_random_works(client);
+    });
+}
+
+#[test]
+fn a_command_one_byte_over_the_cap_is_refused_once_and_the_link_survives() {
+    assert_oversized_command_is_refused_once(0x1111_0005, max_tpm_packet_len() + 1);
+}
+
+#[test]
+fn a_command_overflowing_mid_sequence_is_refused_once_and_the_link_survives() {
+    assert_oversized_command_is_refused_once(
+        0x1111_000A,
+        max_tpm_packet_len() + 2 * TPM_CHUNK_LEN + 1,
+    );
+}
+
+#[test]
+fn a_multi_fragment_command_from_an_unpaired_peer_is_refused_once() {
+    with_session(0x1111_000B, false, |client| {
+        send_and_expect_one_refusal(client, &padded_command(3 * TPM_CHUNK_LEN));
+
+        embassy_futures::block_on(client.send_msg(&Message::PairRequest)).expect("send pair");
+        match next_msg(client) {
+            Message::PairResponse { success: true } => {}
+            other => panic!("expected a successful PairResponse, got {other:?}"),
+        }
+
+        startup(client);
+        assert_get_random_works(client);
     });
 }
 
