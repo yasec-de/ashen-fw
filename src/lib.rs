@@ -20,6 +20,8 @@ pub mod flash_keystore;
 pub mod hw_rng;
 #[cfg(target_os = "none")]
 pub mod sensors;
+#[cfg(target_os = "none")]
+pub mod tamper;
 pub mod noise_link;
 #[cfg(target_os = "none")]
 pub mod panic_link;

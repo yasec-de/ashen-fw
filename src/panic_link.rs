@@ -33,7 +33,20 @@ pub fn register(link: &'static mut dyn PanicReport) {
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     crate::error!("panic: {}", info);
+    flush_wipe_and(Halt::Fault)
+}
 
+/// What to do once SRAM has been wiped.
+pub enum Halt {
+    /// Fault and stay dead until externally reset.
+    Fault,
+    /// Reset the MCU, so it comes back up unkeyed with a freshly manufactured TPM.
+    Reset,
+}
+
+/// Flush queued log messages over the link (best effort), then wipe all SRAM
+/// (TPM seeds and NV, masked key slots, session keys, stacks) and halt.
+pub fn flush_wipe_and(halt: Halt) -> ! {
     let link = critical_section::with(|cs| PANIC_LINK.borrow_ref_mut(cs).take());
     if let Some(link) = link {
         link.flush_log_queue();
@@ -46,26 +59,51 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         static mut _ram_end: u32;
     }
 
-    unsafe {
-        core::arch::asm!(
-            // clear SHCSR.USGFAULTENA, make udf hard fault
-            "  ldr  {val}, [{shcsr}]",
-            "  bic  {val}, {val}, #(1 << 18)",
-            "  str  {val}, [{shcsr}]",
-            // wipe all SRAM memory
-            "1:",
-            "  str  {val}, [{ptr}], #4",
-            "  cmp  {ptr}, {end}",
-            "  blo  1b",
-            // execute the undefined instruction
-            "2:",
-            "  udf  #0",
-            "  b    2b",
-            ptr = in(reg) &raw mut _ram_start,
-            end = in(reg) &raw mut _ram_end,
-            val = in(reg) 0u32,
-            shcsr = in(reg) 0xE000ED24u32,
-            options(nostack, noreturn),
-        );
+    match halt {
+        Halt::Fault => unsafe {
+            core::arch::asm!(
+                // clear SHCSR.USGFAULTENA, make udf hard fault
+                "  ldr  {val}, [{shcsr}]",
+                "  bic  {val}, {val}, #(1 << 18)",
+                "  str  {val}, [{shcsr}]",
+                // the wipe below stores {val}; make sure that's zero, not SHCSR
+                "  mov  {val}, #0",
+                // wipe all SRAM memory
+                "1:",
+                "  str  {val}, [{ptr}], #4",
+                "  cmp  {ptr}, {end}",
+                "  blo  1b",
+                // execute the undefined instruction
+                "2:",
+                "  udf  #0",
+                "  b    2b",
+                ptr = in(reg) &raw mut _ram_start,
+                end = in(reg) &raw mut _ram_end,
+                val = in(reg) 0u32,
+                shcsr = in(reg) 0xE000ED24u32,
+                options(nostack, noreturn),
+            );
+        },
+        Halt::Reset => unsafe {
+            core::arch::asm!(
+                // wipe all SRAM memory
+                "1:",
+                "  str  {zero}, [{ptr}], #4",
+                "  cmp  {ptr}, {end}",
+                "  blo  1b",
+                // AIRCR = VECTKEY | SYSRESETREQ
+                "  dsb",
+                "  str  {req}, [{aircr}]",
+                "  dsb",
+                "2:",
+                "  b    2b",
+                ptr = in(reg) &raw mut _ram_start,
+                end = in(reg) &raw mut _ram_end,
+                zero = in(reg) 0u32,
+                req = in(reg) 0x05FA_0004u32,
+                aircr = in(reg) 0xE000_ED0Cu32,
+                options(nostack, noreturn),
+            );
+        },
     }
 }

@@ -17,7 +17,8 @@ use embassy_stm32::interrupt;
 use embassy_stm32::interrupt::{InterruptExt, Priority};
 use embassy_stm32::{Peri, bind_interrupts, peripherals};
 use embassy_stm32::flash::Flash;
-use embassy_stm32::gpio::{Level, Output, Speed};
+use embassy_stm32::exti::ExtiInput;
+use embassy_stm32::gpio::{Level, Output, Pull, Speed};
 use embassy_stm32::mode::Async;
 use embassy_stm32::peripherals::{LPUART1, RNG};
 use embassy_stm32::rng::Rng;
@@ -53,6 +54,7 @@ bind_interrupts!(struct Irqs {
     GPDMA1_CHANNEL1 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::GPDMA1_CH1>;
     GPDMA1_CHANNEL2 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::GPDMA1_CH2>;
     RNG => embassy_stm32::rng::InterruptHandler<RNG>;
+    EXTI9 => embassy_stm32::exti::InterruptHandler<embassy_stm32::interrupt::typelevel::EXTI9>;
 });
 
 /// Size of the LPUART1 DMA RX ring buffer. At 4 Mbaud a full fragment frame
@@ -95,6 +97,12 @@ impl Write for SplitIo {
     async fn flush(&mut self) -> Result<(), Self::Error> {
         self.tx.flush().await
     }
+}
+
+/// Tamper button on Arduino D10 = PB9 (pressed = low, external pull-up).
+#[embassy_executor::task]
+async fn tamper(input: ExtiInput<'static, embassy_stm32::mode::Async>) {
+    ashen_fw::tamper::monitor(input).await
 }
 
 #[embassy_executor::task]
@@ -140,6 +148,11 @@ async fn session_loop(
     }
 }
 
+struct TamperPeripherals {
+    pin: Peri<'static, peripherals::PB9>,
+    exti: Peri<'static, peripherals::EXTI9>,
+}
+
 struct LinkPeripherals {
     led: Peri<'static, peripherals::PH10>,
     lpuart: Peri<'static, peripherals::LPUART1>,
@@ -153,8 +166,11 @@ struct LinkPeripherals {
 /// Send-safe entry point for [`EXECUTOR_HIGH`]: everything it spawns from here
 /// on goes through a local `Spawner`, which has no `Send` bound.
 #[embassy_executor::task]
-async fn high_prio_init(p: LinkPeripherals) {
+async fn high_prio_init(p: LinkPeripherals, t: TamperPeripherals) {
     let spawner = unsafe { Spawner::for_current_executor() }.await;
+    // Internal pull-up as well, so an unplugged button reads "not tampered".
+    let tamper_input = ExtiInput::new(t.pin, t.exti, Pull::Up, Irqs);
+    spawner.spawn(tamper(tamper_input).expect("failed to spawn tamper task"));
     spawner.spawn(masked_memory::run().expect("failed to spawn remasking task"));
     spawner.spawn(link_bootstrap(p).expect("failed to spawn link bootstrap task"));
 }
@@ -242,6 +258,9 @@ async fn main(spawner: Spawner) {
             dma_tx: p.GPDMA1_CH1,
             dma_rx: p.GPDMA1_CH2,
             flash: p.FLASH,
+        }, TamperPeripherals {
+            pin: p.PB9,
+            exti: p.EXTI9,
         })
         .expect("failed to spawn high priority init task"),
     );
