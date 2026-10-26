@@ -29,8 +29,24 @@ use static_cell::StaticCell;
 #[allow(unused_imports)]
 use ashen_fw::panic_link as _;
 
+/// emballoc guards its heap with a spinlock, so it must never be re-entered from
+/// an interrupt: the link executor (UART5 IRQ) preempting the thread-mode TPM
+/// task mid-allocation would spin on the lock forever. Run every heap operation
+/// with interrupts masked instead; they are short.
+struct IrqSafeAllocator(emballoc::Allocator<131072>);
+
+unsafe impl core::alloc::GlobalAlloc for IrqSafeAllocator {
+    unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
+        critical_section::with(|_| unsafe { self.0.alloc(layout) })
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: core::alloc::Layout) {
+        critical_section::with(|_| unsafe { self.0.dealloc(ptr, layout) })
+    }
+}
+
 #[global_allocator]
-static ALLOCATOR: emballoc::Allocator<131072> = emballoc::Allocator::new();
+static ALLOCATOR: IrqSafeAllocator = IrqSafeAllocator(emballoc::Allocator::new());
 
 bind_interrupts!(struct Irqs {
     LPUART1 => embassy_stm32::usart::InterruptHandler<LPUART1>;
