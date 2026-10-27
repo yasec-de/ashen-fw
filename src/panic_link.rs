@@ -51,7 +51,11 @@ pub fn flush_wipe_and(halt: Halt) -> ! {
     if let Some(link) = link {
         link.flush_log_queue();
     }
+    wipe_and(halt)
+}
 
+/// Wipe all SRAM and halt, without touching the link.
+pub fn wipe_and(halt: Halt) -> ! {
     cortex_m::interrupt::disable();
 
     unsafe extern "C" {

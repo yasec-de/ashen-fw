@@ -15,12 +15,14 @@
 //! struct ashen_msg_echo           { u8 type; __be64 value; };
 //! ```
 //!
-//! Bare commands (`Erase`, `PairRequest`, `StatusRequest`, `Disconnect`) are a
-//! single type byte with no payload.
+//! Bare commands (`Erase`, `PairRequest`, `StatusRequest`, `Disconnect`,
+//! `Tamper`) are a single type byte with no payload.
 
 use alloc::vec::Vec;
 
-use embassy_futures::select::{Either4, select4};
+use embassy_futures::select::{Either, Either4, select, select4};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::signal::Signal;
 use embedded_io_async::{Read, Write};
 
 use crate::noise_link::{Error, KeyStore, NoiseLink};
@@ -46,6 +48,7 @@ pub enum MsgType {
     EchoResponse = 9,
     TpmCommand = 10,
     TpmResponse = 11,
+    Tamper = 12,
 }
 
 /// Largest TPM packet that can be reassembled from a fragment sequence.
@@ -76,6 +79,7 @@ impl MsgType {
             9 => Self::EchoResponse,
             10 => Self::TpmCommand,
             11 => Self::TpmResponse,
+            12 => Self::Tamper,
             _ => return None,
         })
     }
@@ -100,6 +104,8 @@ pub enum Message {
     TpmCommand { more: bool, chunk: Vec<u8> },
     /// One fragment of a TPM 2.0 response packet.
     TpmResponse { more: bool, chunk: Vec<u8> },
+    /// Device to host: the tamper input fired; the host panics at once.
+    Tamper,
 }
 
 impl Message {
@@ -145,6 +151,7 @@ impl Message {
                 out.push(if *more { FLAG_MORE } else { 0 });
                 out.extend_from_slice(chunk);
             }
+            Message::Tamper => out.push(MsgType::Tamper as u8),
         }
         out
     }
@@ -188,6 +195,7 @@ impl Message {
                     chunk: chunk.into(),
                 }
             }
+            MsgType::Tamper => Message::Tamper,
         })
     }
 }
@@ -213,6 +221,12 @@ fn next_fragment(packet: &[u8], pos: usize) -> (&[u8], bool) {
     let end = packet.len().min(pos + TPM_CHUNK_LEN);
     (&packet[pos..end], end < packet.len())
 }
+
+/// Raised by [`crate::tamper`]; the session sends [`Message::Tamper`] between
+/// frames, so it can't interleave with a half-sent frame or skip a nonce.
+pub static TAMPER: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+/// Signalled once the session has handed [`Message::Tamper`] to the UART.
+pub static TAMPER_SENT: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 #[derive(Debug)]
 pub enum SessionEnd {
@@ -449,14 +463,26 @@ impl<T: Read + Write> NoiseLink<T> {
                 }
             };
 
-            match select4(
-                self.receive_msg(),
-                tpm_answer,
-                tpm_output,
-                crate::log::wait_readable(),
+            let event = match select(
+                TAMPER.wait(),
+                select4(
+                    self.receive_msg(),
+                    tpm_answer,
+                    tpm_output,
+                    crate::log::wait_readable(),
+                ),
             )
             .await
             {
+                Either::First(()) => {
+                    let _ = self.send_msg(&Message::Tamper).await;
+                    TAMPER_SENT.signal(());
+                    // The tamper task wipes and resets; send nothing more.
+                    core::future::pending().await
+                }
+                Either::Second(event) => event,
+            };
+            match event {
                 Either4::First(result) => {
                     let result = match result {
                         Ok(msg) => self.handle_message(keystore, &mut tpm, msg).await,
@@ -535,6 +561,7 @@ mod tests {
             Message::Disconnect,
             Message::EchoRequest { value: 0x0102_0304_0506_0708 },
             Message::EchoResponse { value: u64::MAX },
+            Message::Tamper,
         ];
         for msg in cases {
             assert_eq!(Message::decode(&msg.encode()).unwrap(), msg);
